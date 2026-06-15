@@ -50,15 +50,15 @@ npm start
 🌐 API 端点
 
 方法 路径 说明
-GET /{DOH_PATH}?name=域名&type=记录类型 DoH 查询（JSON）
-POST /{DOH_PATH} JSON / 表单 / DNS Wire Format 请求
-GET /api/upstreams 获取上游状态
-POST /api/switch/:id 手动切换到指定上游
-POST /api/auto 切换回自动模式
-POST /api/healthcheck 手动触发健康检查
-GET /api/ip-info?ip=IP&token=xxx IP 地理位置
-GET / Web 管理面板
-GET /health 健康检查端点
+* GET /{DOH_PATH}?name=域名&type=记录类型 DoH 查询（JSON）
+* POST /{DOH_PATH} JSON / 表单 / DNS Wire Format 请求
+* GET /api/upstreams 获取上游状态
+* POST /api/switch/:id 手动切换到指定上游
+* POST /api/auto 切换回自动模式
+* POST /api/healthcheck 手动触发健康检查
+* GET /api/ip-info?ip=IP&token=xxx IP 地理位置
+* GET / Web 管理面板
+* GET /health 健康检查端点
 
 📘 使用示例
 
