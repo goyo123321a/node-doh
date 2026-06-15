@@ -16,7 +16,7 @@ app.use(session({
   secret: SESSION_SECRET,
   resave: false,
   saveUninitialized: false,
-  cookie: { secure: false, maxAge: 24 * 60 * 60 * 1000 } // 24小时
+  cookie: { secure: false, maxAge: 24 * 60 * 60 * 1000 }
 }));
 
 // ============ DoH 路径配置 ============
@@ -759,7 +759,7 @@ app.get('/admin', requireAdmin, (req, res) => {
       <div style="overflow-x: auto;">
         <table class="upstream-table">
           <thead>
-            <tr><th>状态</th><th>上游服务器</th><th>协议</th><th>区域</th><th>响应时间</th><th>操作</th></tr>
+            <tr><th>状态</th><th>上游服务器</th><th>协议</th><th>区域</th><th>响应时间</th><th>操作</th><tr>
           </thead>
           <tbody id="upstreamList"></tbody>
         </table>
@@ -1142,7 +1142,7 @@ app.all(`/${DoH路径}`, async (req, res) => {
   }
 });
 
-// ============ 公开首页（只读，登录按钮在右上角）============
+// ============ 公开首页（使用自定义路径）============
 app.get('/', (req, res) => {
   const hostname = req.headers.host;
   const protocol = req.headers['x-forwarded-proto'] || 'https';
@@ -1164,8 +1164,6 @@ app.get('/', (req, res) => {
       padding: 20px;
     }
     .container { max-width: 1000px; margin: 0 auto; }
-    
-    /* 头部区域 - 包含标题和登录按钮 */
     .header {
       display: flex;
       justify-content: space-between;
@@ -1176,9 +1174,7 @@ app.get('/', (req, res) => {
       gap: 15px;
     }
     .header h1 { font-size: 2.5em; }
-    .header-sub {
-      text-align: right;
-    }
+    .header-sub { text-align: right; }
     .login-btn {
       background: rgba(255,255,255,0.2);
       border: 1px solid rgba(255,255,255,0.3);
@@ -1204,7 +1200,6 @@ app.get('/', (req, res) => {
       margin-bottom: 30px;
       opacity: 0.9;
     }
-    
     .card {
       background: white;
       border-radius: 16px;
@@ -1418,28 +1413,28 @@ app.get('/', (req, res) => {
       <div class="curl-example">
         <pre><strong># GET 请求 - A记录 (IPv4)</strong>
 curl -H "accept: application/dns-json" \\
-  "https://${hostname}/dns-query?name=google.com&type=A"
+  "${currentDohUrl}?name=google.com&type=A"
 
 <strong># GET 请求 - AAAA记录 (IPv6)</strong>
 curl -H "accept: application/dns-json" \\
-  "https://${hostname}/dns-query?name=google.com&type=AAAA"
+  "${currentDohUrl}?name=google.com&type=AAAA"
 
 <strong># POST 请求 - JSON格式 (A记录)</strong>
 curl -X POST -H "Content-Type: application/dns-json" \\
   -d '{"name":"google.com","type":"A"}' \\
-  "https://${hostname}/dns-query"
+  "${currentDohUrl}"
 
 <strong># POST 请求 - 表单格式 (A记录)</strong>
 curl -X POST -H "Content-Type: application/x-www-form-urlencoded" \\
   -d "name=google.com&type=A" \\
-  "https://${hostname}/dns-query"
+  "${currentDohUrl}"
 
 <strong># 浏览器访问 (直接显示JSON)</strong>
-<a href="https://${hostname}/dns-query?name=google.com&type=A" target="_blank">https://${hostname}/dns-query?name=google.com&type=A</a>
+<a href="${currentDohUrl}?name=google.com&type=A" target="_blank">${currentDohUrl}?name=google.com&type=A</a>
 
 <strong># 浏览器配置 DoH</strong>
 Chrome/Edge: 设置 → 隐私和安全 → 安全 → 使用安全 DNS → 自定义
-填入: <strong>https://${hostname}/dns-query</strong></pre>
+填入: <strong>${currentDohUrl}</strong></pre>
       </div>
     </div>
     
@@ -1449,7 +1444,7 @@ Chrome/Edge: 设置 → 隐私和安全 → 安全 → 使用安全 DNS → 自�
   </div>
   
   <script>
-    const endpoint = 'https://${hostname}/dns-query';
+    const endpoint = '${currentDohUrl}';
     document.getElementById('endpoint').innerHTML = endpoint;
     
     async function loadUpstreams() {
