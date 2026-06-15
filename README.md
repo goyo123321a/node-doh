@@ -1,4 +1,3 @@
-```markdown
 # 🚀 DoH Server – 多协议 DNS over HTTPS 代理
 
 一个功能完整的 **DNS over HTTPS (DoH)** 代理服务器，支持多种上游协议（DoH / DNS-over-TLS / TCP / UDP）、自动故障转移、手动上游切换，并提供美观的 Web 管理面板。
