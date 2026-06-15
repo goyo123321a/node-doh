@@ -23,13 +23,13 @@
 1. 使用 Docker
 
 ```bash
-docker run -p 7860:7860 ghcr.io/你的用户名/doh-server:latest
+docker run -p 7860:7860 ghcr.io/goyo1233321a/node-dot:latest
 ```
 
 2. 使用 Node.js
 
 ```bash
-git clone https://github.com/你的用户名/doh-server
+git clone https://goyo1233321a/node-dot:latest
 cd doh-server
 npm install
 npm start
