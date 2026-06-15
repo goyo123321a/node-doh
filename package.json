@@ -1,7 +1,7 @@
 {
   "name": "doh-server",
   "version": "1.0.0",
-  "description": "DNS over HTTPS Server with Admin Panel",
+  "description": "DNS over HTTPS Server - Multi-Protocol Multi-Upstream",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
