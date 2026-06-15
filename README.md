@@ -39,13 +39,13 @@ npm start
 
 🔧 环境变量
 
-变量 说明 默认值
-DOH_PATH DoH 服务端点路径 dns-query
-TOKEN ①备选 DoH 路径；②/api/ip-info 认证 dns-query
-DOH 上游 DNS 服务器列表（逗号分隔） 内置 25 个公共 DNS
-ENABLED_PROTOCOLS 启用的协议（doh,dot,tcp,udp） 全部
-ENABLED_UPSTREAMS 启用的上游名称（逗号分隔） all
-PORT 监听端口 7860
+## 变量 说明 默认值
+* DOH_PATH DoH 服务端点路径 dns-query
+* TOKEN ①备选 DoH 路径；②/api/ip-info 认证 dns-query
+* DOH 上游 DNS 服务器列表（逗号分隔） 内置 25 个公共 DNS
+* ENABLED_PROTOCOLS 启用的协议（doh,dot,tcp,udp） 全部
+* ENABLED_UPSTREAMS 启用的上游名称（逗号分隔） all
+* PORT 监听端口 7860
 
 🌐 API 端点
 
