@@ -7,7 +7,7 @@ const app = express();
 const PORT = process.env.PORT || 7860;
 
 // 管理员密码（从环境变量读取，未设置则后台不可用）
-const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || admin;
+const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || null;
 const SESSION_SECRET = process.env.SESSION_SECRET || 'doh-secret-change-me';
 
 // Session 配置
