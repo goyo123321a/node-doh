@@ -1,0 +1,15 @@
+{
+  "name": "doh-server",
+  "version": "1.0.0",
+  "description": "DNS over HTTPS Server for Hugging Face Spaces",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2"
+  },
+  "engines": {
+    "node": ">=18.x"
+  }
+}
