@@ -210,24 +210,6 @@ function sanitizeHeaderValue(value) {
   return String(value).replace(/[^\x20-\x7E]/g, '').replace(/[\n\r]/g, '').substring(0, 100);
 }
 
-// ============ 补全标准 DoH 响应 ============
-function ensureStandardDoHResponse(data, domain, type) {
-  if (data && data.Status !== undefined) {
-    return data; // 已有 Status 字段
-  }
-  // 构造标准格式
-  return {
-    Status: 0,
-    TC: false,
-    RD: true,
-    RA: true,
-    AD: false,
-    CD: false,
-    Question: [{ name: domain, type: recordTypeMap[type] || 1, class: 1 }],
-    Answer: (data && data.Answer) || []
-  };
-}
-
 // 健康检查
 async function checkSingleUpstream(upstream) {
   const startTime = Date.now();
@@ -992,12 +974,25 @@ app.get('/api/dns', async (req, res) => {
     } else {
       const result = await queryWithFallback(domain, type);
       if (result.success) {
+        // 确保返回标准 DoH 格式（包含 Status 等字段）
+        let responseData = result.data;
+        if (!responseData.Status && responseData.Status !== 0) {
+          responseData = {
+            Status: 0,
+            TC: false,
+            RD: true,
+            RA: true,
+            AD: false,
+            CD: false,
+            Question: [{ name: domain, type: recordTypeMap[type] || 1, class: 1 }],
+            Answer: responseData.Answer || []
+          };
+        }
         res.json({
           Status: 0,
           upstream: result.upstream,
           protocol: result.protocol,
-          Answer: result.data.Answer || [],
-          Question: [{ name: domain, type: recordTypeMap[type] || 1, class: 1 }]
+          ...responseData
         });
       } else {
         res.json({
@@ -1030,6 +1025,26 @@ app.all(`/${DoH路径}`, async (req, res) => {
     res.set('X-Upstream', safeUpstreamName);
     res.set('X-Protocol', upstream.protocol.toUpperCase());
     
+    // 辅助函数：标准化 DoH 响应
+    const normalizeDoHResponse = (data, domain, type) => {
+      if (!data) return null;
+      // 如果已经有 Status 字段，直接返回
+      if (data.Status !== undefined) {
+        return data;
+      }
+      // 否则补全标准字段
+      return {
+        Status: 0,
+        TC: false,
+        RD: true,
+        RA: true,
+        AD: false,
+        CD: false,
+        Question: [{ name: domain, type: recordTypeMap[type] || 1, class: 1 }],
+        Answer: data.Answer || []
+      };
+    };
+    
     if (method === 'GET') {
       const url = new URL(req.url, `http://${req.headers.host}`);
       
@@ -1039,10 +1054,9 @@ app.all(`/${DoH路径}`, async (req, res) => {
         
         const result = await queryDNS(upstream, domain, type);
         if (result.success && result.data) {
-          // 确保返回标准 DoH 格式
-          const responseData = ensureStandardDoHResponse(result.data, domain, type);
+          const normalizedData = normalizeDoHResponse(result.data, domain, type);
           res.set('Content-Type', 'application/dns-json');
-          return res.json(responseData);
+          return res.json(normalizedData);
         } else {
           res.set('Content-Type', 'application/json');
           return res.status(500).json({ error: 'DNS 查询失败', code: 'QUERY_FAILED' });
@@ -1128,10 +1142,9 @@ app.all(`/${DoH路径}`, async (req, res) => {
       if (domain && !response) {
         const result = await queryDNS(upstream, domain, type);
         if (result.success && result.data) {
-          // 确保返回标准 DoH 格式
-          const responseData = ensureStandardDoHResponse(result.data, domain, type);
+          const normalizedData = normalizeDoHResponse(result.data, domain, type);
           res.set('Content-Type', 'application/dns-json');
-          return res.json(responseData);
+          return res.json(normalizedData);
         } else {
           res.set('Content-Type', 'application/json');
           return res.status(500).json({ error: 'DNS 查询失败', code: 'QUERY_FAILED' });
@@ -1164,7 +1177,7 @@ app.all(`/${DoH路径}`, async (req, res) => {
   }
 });
 
-// ============ 公开首页（只读，登录按钮在右上角）============
+// ============ 公开首页 ============
 app.get('/', (req, res) => {
   const hostname = req.headers.host;
   const protocol = req.headers['x-forwarded-proto'] || 'https';
@@ -1186,8 +1199,6 @@ app.get('/', (req, res) => {
       padding: 20px;
     }
     .container { max-width: 1000px; margin: 0 auto; }
-    
-    /* 头部区域 - 包含标题和登录按钮 */
     .header {
       display: flex;
       justify-content: space-between;
@@ -1198,9 +1209,7 @@ app.get('/', (req, res) => {
       gap: 15px;
     }
     .header h1 { font-size: 2.5em; }
-    .header-sub {
-      text-align: right;
-    }
+    .header-sub { text-align: right; }
     .login-btn {
       background: rgba(255,255,255,0.2);
       border: 1px solid rgba(255,255,255,0.3);
@@ -1226,7 +1235,6 @@ app.get('/', (req, res) => {
       margin-bottom: 30px;
       opacity: 0.9;
     }
-    
     .card {
       background: white;
       border-radius: 16px;
