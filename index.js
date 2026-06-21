@@ -417,6 +417,26 @@ function getCurrentStatus() {
   };
 }
 
+// ============ 辅助函数：格式化 DoH 响应 ============
+function formatDNSResponse(data, domain, type) {
+  // 如果 data 已经包含完整字段，直接返回
+  if (data.Status !== undefined || data.Status === 0) {
+    return data;
+  }
+  // 否则补齐标准字段
+  const typeNum = recordTypeMap[type] || 1;
+  return {
+    Status: 0,
+    TC: false,
+    RD: true,
+    RA: true,
+    AD: false,
+    CD: false,
+    Question: [{ name: domain, type: typeNum, class: 1 }],
+    Answer: data.Answer || []
+  };
+}
+
 // ============ 中间件 ============
 app.use(express.json({ type: 'application/dns-json' }));
 app.use(express.urlencoded({ extended: true }));
@@ -974,25 +994,13 @@ app.get('/api/dns', async (req, res) => {
     } else {
       const result = await queryWithFallback(domain, type);
       if (result.success) {
-        // 确保返回标准 DoH 格式（包含 Status 等字段）
-        let responseData = result.data;
-        if (!responseData.Status && responseData.Status !== 0) {
-          responseData = {
-            Status: 0,
-            TC: false,
-            RD: true,
-            RA: true,
-            AD: false,
-            CD: false,
-            Question: [{ name: domain, type: recordTypeMap[type] || 1, class: 1 }],
-            Answer: responseData.Answer || []
-          };
-        }
+        // 使用格式化函数补齐字段
+        const formatted = formatDNSResponse(result.data, domain, type);
         res.json({
-          Status: 0,
+          Status: formatted.Status,
           upstream: result.upstream,
           protocol: result.protocol,
-          ...responseData
+          ...formatted
         });
       } else {
         res.json({
@@ -1025,26 +1033,6 @@ app.all(`/${DoH路径}`, async (req, res) => {
     res.set('X-Upstream', safeUpstreamName);
     res.set('X-Protocol', upstream.protocol.toUpperCase());
     
-    // 辅助函数：标准化 DoH 响应
-    const normalizeDoHResponse = (data, domain, type) => {
-      if (!data) return null;
-      // 如果已经有 Status 字段，直接返回
-      if (data.Status !== undefined) {
-        return data;
-      }
-      // 否则补全标准字段
-      return {
-        Status: 0,
-        TC: false,
-        RD: true,
-        RA: true,
-        AD: false,
-        CD: false,
-        Question: [{ name: domain, type: recordTypeMap[type] || 1, class: 1 }],
-        Answer: data.Answer || []
-      };
-    };
-    
     if (method === 'GET') {
       const url = new URL(req.url, `http://${req.headers.host}`);
       
@@ -1054,12 +1042,18 @@ app.all(`/${DoH路径}`, async (req, res) => {
         
         const result = await queryDNS(upstream, domain, type);
         if (result.success && result.data) {
-          const normalizedData = normalizeDoHResponse(result.data, domain, type);
+          // 格式化响应，补齐字段
+          const formatted = formatDNSResponse(result.data, domain, type);
           res.set('Content-Type', 'application/dns-json');
-          return res.json(normalizedData);
+          return res.json(formatted);
         } else {
-          res.set('Content-Type', 'application/json');
-          return res.status(500).json({ error: 'DNS 查询失败', code: 'QUERY_FAILED' });
+          res.set('Content-Type', 'application/dns-json');
+          return res.status(500).json({ 
+            Status: 2,
+            Answer: [],
+            error: 'DNS 查询失败',
+            code: 'QUERY_FAILED'
+          });
         }
       }
       
@@ -1142,12 +1136,18 @@ app.all(`/${DoH路径}`, async (req, res) => {
       if (domain && !response) {
         const result = await queryDNS(upstream, domain, type);
         if (result.success && result.data) {
-          const normalizedData = normalizeDoHResponse(result.data, domain, type);
+          // 格式化响应，补齐字段
+          const formatted = formatDNSResponse(result.data, domain, type);
           res.set('Content-Type', 'application/dns-json');
-          return res.json(normalizedData);
+          return res.json(formatted);
         } else {
-          res.set('Content-Type', 'application/json');
-          return res.status(500).json({ error: 'DNS 查询失败', code: 'QUERY_FAILED' });
+          res.set('Content-Type', 'application/dns-json');
+          return res.status(500).json({ 
+            Status: 2,
+            Answer: [],
+            error: 'DNS 查询失败',
+            code: 'QUERY_FAILED'
+          });
         }
       }
       
@@ -1177,7 +1177,7 @@ app.all(`/${DoH路径}`, async (req, res) => {
   }
 });
 
-// ============ 公开首页 ============
+// ============ 公开首页（使用自定义路径）============
 app.get('/', (req, res) => {
   const hostname = req.headers.host;
   const protocol = req.headers['x-forwarded-proto'] || 'https';
