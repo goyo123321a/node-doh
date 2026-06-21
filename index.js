@@ -437,6 +437,15 @@ function formatDNSResponse(data, domain, type) {
   };
 }
 
+// ============ 辅助函数：设置 JSON 响应头（修复浏览器下载） ============
+function setJsonHeaders(res) {
+  res.set('Content-Type', 'application/json');
+  res.set('Content-Disposition', 'inline');
+  res.set('Cache-Control', 'no-cache, no-store, must-revalidate');
+  res.set('Pragma', 'no-cache');
+  res.set('Expires', '0');
+}
+
 // ============ 中间件 ============
 app.use(express.json({ type: 'application/dns-json' }));
 app.use(express.urlencoded({ extended: true }));
@@ -986,24 +995,27 @@ app.get('/api/dns', async (req, res) => {
   try {
     if (type === 'all') {
       const results = await queryAllTypes(domain);
-      res.json({
+      const formatted = {
         Status: 0,
         upstream: results.upstream || 'auto',
         ...results
-      });
+      };
+      setJsonHeaders(res);
+      return res.json(formatted);
     } else {
       const result = await queryWithFallback(domain, type);
       if (result.success) {
-        // 使用格式化函数补齐字段
         const formatted = formatDNSResponse(result.data, domain, type);
-        res.json({
+        setJsonHeaders(res);
+        return res.json({
           Status: formatted.Status,
           upstream: result.upstream,
           protocol: result.protocol,
           ...formatted
         });
       } else {
-        res.json({
+        setJsonHeaders(res);
+        return res.status(404).json({
           Status: 2,
           upstream: null,
           Answer: [],
@@ -1012,6 +1024,7 @@ app.get('/api/dns', async (req, res) => {
       }
     }
   } catch (err) {
+    setJsonHeaders(res);
     res.status(500).json({ error: err.message });
   }
 });
@@ -1042,12 +1055,11 @@ app.all(`/${DoH路径}`, async (req, res) => {
         
         const result = await queryDNS(upstream, domain, type);
         if (result.success && result.data) {
-          // 格式化响应，补齐字段
           const formatted = formatDNSResponse(result.data, domain, type);
-          res.set('Content-Type', 'application/dns-json');
+          setJsonHeaders(res);
           return res.json(formatted);
         } else {
-          res.set('Content-Type', 'application/dns-json');
+          setJsonHeaders(res);
           return res.status(500).json({ 
             Status: 2,
             Answer: [],
@@ -1062,7 +1074,7 @@ app.all(`/${DoH路径}`, async (req, res) => {
           headers: { 'Accept': 'application/dns-message', 'User-Agent': UA }
         });
       } else {
-        res.set('Content-Type', 'application/json');
+        setJsonHeaders(res);
         return res.status(400).json({ error: '缺少参数 name 或 dns' });
       }
     } else if (method === 'POST') {
@@ -1086,7 +1098,7 @@ app.all(`/${DoH路径}`, async (req, res) => {
           domain = jsonBody.name || jsonBody.domain;
           type = jsonBody.type || 'A';
         } catch (e) {
-          res.set('Content-Type', 'application/json');
+          setJsonHeaders(res);
           return res.status(400).json({ error: '无效的 JSON 格式', message: e.message });
         }
       } else if (contentType.includes('application/x-www-form-urlencoded')) {
@@ -1100,7 +1112,7 @@ app.all(`/${DoH路径}`, async (req, res) => {
             type = params.get('type') || 'A';
           }
         } catch (e) {
-          res.set('Content-Type', 'application/json');
+          setJsonHeaders(res);
           return res.status(400).json({ error: '无效的表单格式' });
         }
       } else if (contentType.includes('application/dns-message')) {
@@ -1119,7 +1131,7 @@ app.all(`/${DoH路径}`, async (req, res) => {
           domain = jsonBody.name || jsonBody.domain;
           type = jsonBody.type || 'A';
         } catch (e) {
-          res.set('Content-Type', 'application/json');
+          setJsonHeaders(res);
           return res.status(400).json({ error: '无法解析 JSON 请求体' });
         }
       } else if (rawBody.includes('=')) {
@@ -1128,7 +1140,7 @@ app.all(`/${DoH路径}`, async (req, res) => {
           domain = params.get('name') || params.get('domain');
           type = params.get('type') || 'A';
         } catch (e) {
-          res.set('Content-Type', 'application/json');
+          setJsonHeaders(res);
           return res.status(400).json({ error: '无法解析表单请求体' });
         }
       }
@@ -1136,12 +1148,11 @@ app.all(`/${DoH路径}`, async (req, res) => {
       if (domain && !response) {
         const result = await queryDNS(upstream, domain, type);
         if (result.success && result.data) {
-          // 格式化响应，补齐字段
           const formatted = formatDNSResponse(result.data, domain, type);
-          res.set('Content-Type', 'application/dns-json');
+          setJsonHeaders(res);
           return res.json(formatted);
         } else {
-          res.set('Content-Type', 'application/dns-json');
+          setJsonHeaders(res);
           return res.status(500).json({ 
             Status: 2,
             Answer: [],
@@ -1152,7 +1163,7 @@ app.all(`/${DoH路径}`, async (req, res) => {
       }
       
       if (!domain && !response) {
-        res.set('Content-Type', 'application/json');
+        setJsonHeaders(res);
         return res.status(400).json({ 
           error: '无法解析请求', 
           message: '请确保请求包含 name 或 domain 参数',
@@ -1164,15 +1175,16 @@ app.all(`/${DoH路径}`, async (req, res) => {
     if (response) {
       if (!response.ok) throw new Error(`DoH 返回错误 (${response.status})`);
       const responseBody = await response.buffer();
+      // 对于 Wire Format 响应，不要修改 Content-Type
       return res.status(response.status).send(responseBody);
     }
     
-    res.set('Content-Type', 'application/json');
+    setJsonHeaders(res);
     return res.status(400).json({ error: '不支持的请求格式' });
     
   } catch (error) {
     console.error("DoH 请求处理错误:", error);
-    res.set('Content-Type', 'application/json');
+    setJsonHeaders(res);
     res.status(500).json({ error: '内部服务器错误', message: error.message, code: 'INTERNAL_ERROR' });
   }
 });
@@ -1645,6 +1657,7 @@ Chrome/Edge: 设置 → 隐私和安全 → 安全 → 使用安全 DNS → 自�
 
 app.get('/health', (req, res) => {
   const status = getCurrentStatus();
+  setJsonHeaders(res);
   res.json({ 
     status: 'ok', 
     timestamp: new Date().toISOString(),
