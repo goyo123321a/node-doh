@@ -212,6 +212,18 @@ function sanitizeHeaderValue(value) {
   return String(value).replace(/[^a-zA-Z0-9 \-_.]/g, '').substring(0, 100);
 }
 
+// ============ 统一备用 DoH 获取函数 ============
+function getDoHEndpoint(upstream, context = 'Wire format') {
+  if (upstream.protocol === 'doh') {
+    // 如果当前上游是 DoH，直接使用，不打印备用日志
+    return upstream.server;
+  }
+  // 否则使用备用 DoH（默认 Cloudflare）
+  const fallback = process.env.FALLBACK_DOH || 'https://cloudflare-dns.com/dns-query';
+  console.log(`${context} 使用备用 DoH: ${fallback}`);
+  return fallback;
+}
+
 // 健康检查
 async function checkSingleUpstream(upstream) {
   const startTime = Date.now();
@@ -303,14 +315,11 @@ function getCurrentUpstream() {
   return upstreams[0];
 }
 
-// ============ 核心查询函数 ============
+// ============ 核心查询函数（含 HTTPS 记录回退） ============
 async function queryDNS(upstream, domain, type) {
   if (type === 'HTTPS') {
-    let dohServer = upstream.server;
-    if (upstream.protocol !== 'doh') {
-      dohServer = 'https://cloudflare-dns.com/dns-query';
-      console.log(`HTTPS 查询强制使用 DoH 备用服务器: ${dohServer}`);
-    }
+    // 使用统一函数获取 DoH 端点（可能回退到备用）
+    const dohServer = getDoHEndpoint(upstream, 'HTTPS');
     const result = await queryDoH(dohServer, domain, type);
     if (result.success && result.data) {
       return { success: true, data: result.data };
@@ -459,15 +468,6 @@ function setJsonHeaders(res) {
   res.set('Expires', '0');
 }
 
-function getDoHEndpoint(upstream) {
-  if (upstream.protocol === 'doh') {
-    return upstream.server;
-  }
-  const fallback = process.env.FALLBACK_DOH || 'https://dns.alidns.com/dns-query';
-  console.log(`Wire format 使用备用 DoH: ${fallback}`);
-  return fallback;
-}
-
 // ============ 中间件 ============
 app.use(express.json({ type: 'application/dns-json' }));
 app.use(express.urlencoded({ extended: true }));
@@ -492,7 +492,7 @@ function requireAdmin(req, res, next) {
   }
 }
 
-// ============ 管理员路由（与之前相同，未改动） ============
+// ============ 管理员路由（与之前相同） ============
 app.get('/admin/login', (req, res) => {
   const html = `<!DOCTYPE html>
 <html lang="zh-CN">
@@ -1046,7 +1046,7 @@ app.get('/api/dns', async (req, res) => {
   }
 });
 
-// ============ DoH 端点（修复 response.buffer 错误） ============
+// ============ DoH 端点（支持 wire format，统一备用 DoH） ============
 app.all(`/${DoH路径}`, async (req, res) => {
   const { method, headers, body } = req;
   const UA = headers['user-agent'] || 'DoH Client';
@@ -1069,14 +1069,14 @@ app.all(`/${DoH路径}`, async (req, res) => {
         type = url.searchParams.get('type') || 'A';
 
         if (accept.includes('application/dns-message')) {
-          const dohEndpoint = getDoHEndpoint(upstream);
+          // 使用统一函数获取 DoH 端点（可能回退）
+          const dohEndpoint = getDoHEndpoint(upstream, 'Wire format');
           const upstreamUrl = new URL(dohEndpoint);
           upstreamUrl.searchParams.set('name', domain);
           upstreamUrl.searchParams.set('type', type);
           const wireResponse = await fetch(upstreamUrl.toString(), {
             headers: { 'Accept': 'application/dns-message', 'User-Agent': UA }
           });
-          // 获取二进制数据（修复 buffer 错误）
           const arrayBuffer = await wireResponse.arrayBuffer();
           const wireBody = Buffer.from(arrayBuffer);
           res.set('Content-Type', 'application/dns-message');
@@ -1104,7 +1104,7 @@ app.all(`/${DoH路径}`, async (req, res) => {
 
       // 处理 ?dns= 参数（Base64URL 编码的 wire data）
       if (url.searchParams.has('dns')) {
-        const dohEndpoint = getDoHEndpoint(upstream);
+        const dohEndpoint = getDoHEndpoint(upstream, 'Wire format');
         const base64url = url.searchParams.get('dns');
         const upstreamUrl = new URL(dohEndpoint);
         upstreamUrl.searchParams.set('dns', base64url);
@@ -1164,7 +1164,7 @@ app.all(`/${DoH路径}`, async (req, res) => {
         }
       } else if (contentType.includes('application/dns-message')) {
         // 直接转发 wire format POST
-        const dohEndpoint = getDoHEndpoint(upstream);
+        const dohEndpoint = getDoHEndpoint(upstream, 'Wire format');
         response = await fetch(dohEndpoint, {
           method: 'POST',
           headers: {
@@ -1197,7 +1197,7 @@ app.all(`/${DoH路径}`, async (req, res) => {
       // 如果解析出了 domain，执行查询
       if (domain && !response) {
         if (accept.includes('application/dns-message')) {
-          const dohEndpoint = getDoHEndpoint(upstream);
+          const dohEndpoint = getDoHEndpoint(upstream, 'Wire format');
           const upstreamUrl = new URL(dohEndpoint);
           upstreamUrl.searchParams.set('name', domain);
           upstreamUrl.searchParams.set('type', type);
@@ -1243,7 +1243,6 @@ app.all(`/${DoH路径}`, async (req, res) => {
       if (!response.ok) throw new Error(`DoH 返回错误 (${response.status})`);
       const arrayBuffer = await response.arrayBuffer();
       const responseBody = Buffer.from(arrayBuffer);
-      // 不复制所有头，只设置必要的
       res.set('Content-Type', 'application/dns-message');
       res.set('Content-Length', responseBody.length);
       res.set('Access-Control-Allow-Origin', '*');
@@ -1260,7 +1259,7 @@ app.all(`/${DoH路径}`, async (req, res) => {
   }
 });
 
-// ============ 公开首页（与之前相同） ============
+// ============ 公开首页 ============
 app.get('/', (req, res) => {
   const hostname = req.headers.host;
   const protocol = req.headers['x-forwarded-proto'] || 'https';
