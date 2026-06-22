@@ -92,6 +92,3 @@ https://zwmztkpw-wzvigdwr.hf.space/123a?name=google.com&type=A
 # 浏览器配置 DoH
 Chrome/Edge: 设置 → 隐私和安全 → 安全 → 使用安全 DNS → 自定义
 填入: https://zwmztkpw-wzvigdwr.hf.space/123a
-MIT
-
-```
