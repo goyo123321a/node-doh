@@ -63,7 +63,7 @@ curl -H "accept: application/dns-json" \
   "https://zwmztkpw-wzvigdwr.hf.space/123a?name=cloudflare-ech.com&type=HTTPS"
 ```
 
- # GET 请求 – Wire Format（?dns=）
+# GET 请求 – Wire Format（?dns=）
 # 查询 google.com A 记录（Base64URL 编码示例）
 ```
 curl -H "accept: application/dns-message" \
