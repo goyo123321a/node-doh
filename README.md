@@ -52,8 +52,10 @@ npm start
 
  使用示例
 # GET 请求 - A记录 (IPv4)
-```curl -H "accept: application/dns-json" \
-  "https://zwmztkpw-wzvigdwr.hf.space/123a?name=google.com&type=A"```
+```
+curl -H "accept: application/dns-json" \
+  "https://zwmztkpw-wzvigdwr.hf.space/123a?name=google.com&type=A"
+```
 
 # GET 请求 - HTTPS记录 (ECH配置)
 ```curl -H "accept: application/dns-json" \
