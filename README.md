@@ -58,25 +58,33 @@ curl -H "accept: application/dns-json" \
 ```
 
 # GET 请求 - HTTPS记录 (ECH配置)
-```curl -H "accept: application/dns-json" \
-  "https://zwmztkpw-wzvigdwr.hf.space/123a?name=cloudflare-ech.com&type=HTTPS"```
+```
+curl -H "accept: application/dns-json" \
+  "https://zwmztkpw-wzvigdwr.hf.space/123a?name=cloudflare-ech.com&type=HTTPS"
+```
 
  # GET 请求 – Wire Format（?dns=）
 # 查询 google.com A 记录（Base64URL 编码示例）
-```curl -H "accept: application/dns-message" \
-  "https://hcfcwwba-oleksxxr.hf.space/node-doh?dns=AAABAAABAAAAAAAAB2V4YW1wbGUDY29tAAABAAE"```
+```
+curl -H "accept: application/dns-message" \
+  "https://hcfcwwba-oleksxxr.hf.space/node-doh?dns=AAABAAABAAAAAAAAB2V4YW1wbGUDY29tAAABAAE"
+```
 预期：返回二进制 DNS 数据（终端会显示乱码，这是正常的）。
 验证响应头：content-type: application/dns-message
 
 # POST 请求 - JSON格式 (A记录)
-```curl -X POST -H "Content-Type: application/dns-json" \
+```
+curl -X POST -H "Content-Type: application/dns-json" \
   -d '{"name":"google.com","type":"A"}' \
-  "https://zwmztkpw-wzvigdwr.hf.space/123a"```
+  "https://zwmztkpw-wzvigdwr.hf.space/123a"
+```
 
 # POST 请求 - 表单格式 (A记录)
-```curl -X POST -H "Content-Type: application/x-www-form-urlencoded" \
+```
+curl -X POST -H "Content-Type: application/x-www-form-urlencoded" \
   -d "name=google.com&type=A" \
-  "https://zwmztkpw-wzvigdwr.hf.space/123a"```
+  "https://zwmztkpw-wzvigdwr.hf.space/123a"
+```
 
 # 浏览器访问 (直接显示JSON)
 https://zwmztkpw-wzvigdwr.hf.space/123a?name=google.com&type=A
