@@ -39,56 +39,42 @@ npm start
 
 🔧 环境变量
 
-## 变量 说明 默认值
-* DOH_PATH DoH 服务端点路径 dns-query
-* TOKEN ①备选 DoH 路径；②/api/ip-info 认证 dns-query
-* DOH 上游 DNS 服务器列表（逗号分隔） 内置 25 个公共 DNS
-* ENABLED_PROTOCOLS 启用的协议（doh,dot,tcp,udp） 全部
-* ENABLED_UPSTREAMS 启用的上游名称（逗号分隔） all
-* PORT 监听端口 7860
+### 📋 环境变量
 
-🌐 API 端点
+| 变量名 | 是否必须 | 默认值 | 说明 |
+|--------|----------|--------|------|
+| DOH_PATH | 否 | dns-query |  服务端点路径（优先级最高） dns-query my-dns, query, doh |
+| TOKEN | 否 | dns-query | 备选 DoH 路径 |
+| ADMIN_USER | 否 | admin | 管理员登录用户名 admin |
+| ADMIN_PASS | 否 | 123321 | 管理员登录密码 123321 |
+| SESSION_SECRET | 否 | doh-server-secret-key | Session 加密密钥（用于登录状态）随机字符串如abc123xyz |
+| PORT | 是 | 7860 | 服务监听端口（Hugging Face 要求 7860） |
 
-方法 路径 说明
-* GET /{DOH_PATH}?name=域名&type=记录类型 DoH 查询（JSON）
-* POST /{DOH_PATH} JSON / 表单 / DNS Wire Format 请求
-* GET /api/upstreams 获取上游状态
-* POST /api/switch/:id 手动切换到指定上游
-* POST /api/auto 切换回自动模式
-* POST /api/healthcheck 手动触发健康检查
-* GET /api/ip-info?ip=IP&token=xxx IP 地理位置
-* GET / Web 管理面板
-* GET /health 健康检查端点
+ 使用示例
+# GET 请求 - A记录 (IPv4)
+curl -H "accept: application/dns-json" \
+  "https://zwmztkpw-wzvigdwr.hf.space/123a?name=google.com&type=A"
 
-📘 使用示例
+# GET 请求 - HTTPS记录 (ECH配置)
+curl -H "accept: application/dns-json" \
+  "https://zwmztkpw-wzvigdwr.hf.space/123a?name=cloudflare-ech.com&type=HTTPS"
 
-```bash
-# GET 查询 A 记录
-curl "https://your-space.hf.space/dns-query?name=google.com&type=A"
-
-# POST JSON 查询 AAAA 记录
+# POST 请求 - JSON格式 (A记录)
 curl -X POST -H "Content-Type: application/dns-json" \
-     -d '{"name":"google.com","type":"AAAA"}' \
-     "https://your-space.hf.space/dns-query"
+  -d '{"name":"google.com","type":"A"}' \
+  "https://zwmztkpw-wzvigdwr.hf.space/123a"
 
-# POST 表单查询 MX 记录
+# POST 请求 - 表单格式 (A记录)
 curl -X POST -H "Content-Type: application/x-www-form-urlencoded" \
-     -d "name=google.com&type=MX" \
-     "https://your-space.hf.space/dns-query"
-```
+  -d "name=google.com&type=A" \
+  "https://zwmztkpw-wzvigdwr.hf.space/123a"
 
-🐳 部署到 Hugging Face Spaces
+# 浏览器访问 (直接显示JSON)
+https://zwmztkpw-wzvigdwr.hf.space/123a?name=google.com&type=A
 
-1. 创建新 Space，选择 Docker 运行时
-2. 上传以下文件：
-   · Dockerfile
-   · package.json
-   · index.js
-3. 在 Space 的 Settings → Repository Secrets 中可选配置环境变量（如 DOH_PATH、DOH 等）
-4. Space 自动构建并运行
-
-📄 许可证
-
+# 浏览器配置 DoH
+Chrome/Edge: 设置 → 隐私和安全 → 安全 → 使用安全 DNS → 自定义
+填入: https://zwmztkpw-wzvigdwr.hf.space/123a
 MIT
 
 ```
