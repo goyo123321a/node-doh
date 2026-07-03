@@ -6,10 +6,10 @@
 
 - ✅ 标准 DoH 端点（兼容 [RFC 8484](https://datatracker.ietf.org/doc/html/rfc8484)）  
   支持 `GET`、`POST JSON`、`POST 表单`、`DNS Wire Format` 等请求方式
-- ✅ **37+ 内置公共 DNS 上游**（Cloudflare、Google、阿里云、腾讯云、Quad9、DNS.SB 等）
+- ✅ **9+ 内置公共 DNS 上游**（Cloudflare、Google、阿里云、腾讯云、Quad9、DNS.SB 等）
 - ✅ **自动健康检查 + 故障转移**（每 30 秒检测，按响应时间排序，自动切换至最快上游）
 - ✅ **手动上游切换**（支持自动模式 / 手动模式）
-- ✅ **多协议上游**（DoH / DoT / TCP / UDP 混合使用）
+- ✅ **多DOH上游**（9个DoH）
 - ✅ **Web 管理面板**  
   查看上游状态、响应时间、手动切换、DNS 查询工具
 - ✅ **丰富的 DNS 记录类型**  
