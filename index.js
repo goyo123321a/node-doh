@@ -1,6 +1,4 @@
 const express = require('express');
-const dns = require('dns');
-const { Resolver } = require('dns').promises;
 const session = require('express-session');
 
 const app = express();
@@ -41,141 +39,30 @@ const recordTypeMap = {
   'SOA': 6, 'PTR': 12, 'SRV': 33, 'CAA': 257, 'HTTPS': 65, 'ANY': 255
 };
 
-// ============ 多协议 DNS 上游配置 ============
+// ============ 仅 DoH 上游配置 ============
 const upstreamsConfig = [
-  { name: "alidns-doh", display: "阿里云", server: "https://dns.alidns.com/dns-query", protocol: "doh", region: "中国", type: "DoH", priority: 1 },
-  { name: "cloudflare-doh", display: "Cloudflare", server: "https://cloudflare-dns.com/dns-query", protocol: "doh", region: "全球", type: "DoH", priority: 2 },
-  { name: "google-doh", display: "Google", server: "https://dns.google/dns-query", protocol: "doh", region: "全球", type: "DoH", priority: 3 },
-  { name: "quad9-doh", display: "Quad9", server: "https://dns.quad9.net/dns-query", protocol: "doh", region: "全球", type: "DoH", priority: 4 },
-  { name: "tencent-doh", display: "腾讯云", server: "https://doh.pub/dns-query", protocol: "doh", region: "中国", type: "DoH", priority: 5 },
-  { name: "360-doh", display: "360", server: "https://doh.360.cn/dns-query", protocol: "doh", region: "中国", type: "DoH", priority: 6 },
-  { name: "adguard-doh", display: "AdGuard", server: "https://dns.adguard-dns.com/dns-query", protocol: "doh", region: "全球", type: "DoH+去广告", priority: 7 },
-  { name: "dns-sb-doh", display: "DNS.SB", server: "https://dns.sb/dns-query", protocol: "doh", region: "全球", type: "DoH", priority: 8 },
-  { name: "cloudflare-dot", display: "Cloudflare", server: "1.1.1.1", protocol: "dot", port: 853, region: "全球", type: "DoT", priority: 10 },
-  { name: "google-dot", display: "Google", server: "8.8.8.8", protocol: "dot", port: 853, region: "全球", type: "DoT", priority: 11 },
-  { name: "quad9-dot", display: "Quad9", server: "9.9.9.9", protocol: "dot", port: 853, region: "全球", type: "DoT", priority: 12 },
-  { name: "alidns-dot", display: "阿里云", server: "223.5.5.5", protocol: "dot", port: 853, region: "中国", type: "DoT", priority: 13 },
-  { name: "tencent-dot", display: "腾讯云", server: "119.29.29.29", protocol: "dot", port: 853, region: "中国", type: "DoT", priority: 14 },
-  { name: "cloudflare-tcp", display: "Cloudflare", server: "1.1.1.1", protocol: "tcp", port: 53, region: "全球", type: "TCP", priority: 20 },
-  { name: "google-tcp", display: "Google", server: "8.8.8.8", protocol: "tcp", port: 53, region: "全球", type: "TCP", priority: 21 },
-  { name: "quad9-tcp", display: "Quad9", server: "9.9.9.9", protocol: "tcp", port: 53, region: "全球", type: "TCP", priority: 22 },
-  { name: "alidns-tcp", display: "阿里云", server: "223.5.5.5", protocol: "tcp", port: 53, region: "中国", type: "TCP", priority: 23 },
-  { name: "cloudflare-udp", display: "Cloudflare", server: "1.1.1.1", protocol: "udp", port: 53, region: "全球", type: "UDP", priority: 30 },
-  { name: "google-udp", display: "Google", server: "8.8.8.8", protocol: "udp", port: 53, region: "全球", type: "UDP", priority: 31 },
-  { name: "quad9-udp", display: "Quad9", server: "9.9.9.9", protocol: "udp", port: 53, region: "全球", type: "UDP", priority: 32 },
-  { name: "opendns-udp", display: "OpenDNS", server: "208.67.222.222", protocol: "udp", port: 53, region: "全球", type: "UDP", priority: 33 },
-  { name: "comodo-udp", display: "Comodo", server: "8.26.56.26", protocol: "udp", port: 53, region: "全球", type: "UDP", priority: 34 },
-  { name: "alidns-udp", display: "阿里云", server: "223.5.5.5", protocol: "udp", port: 53, region: "中国", type: "UDP", priority: 35 },
-  { name: "tencent-udp", display: "腾讯云", server: "119.29.29.29", protocol: "udp", port: 53, region: "中国", type: "UDP", priority: 36 },
-  { name: "baidu-udp", display: "百度", server: "180.76.76.76", protocol: "udp", port: 53, region: "中国", type: "UDP", priority: 37 }
+  { name: "cloudflare-dns.com", display: "Cloudflare", server: "https://cloudflare-dns.com/dns-query", region: "全球", type: "DoH", priority: 1 },
+  { name: "dns.google", display: "Google", server: "https://dns.google/dns-query", region: "全球", type: "DoH", priority: 2 },
+  { name: "dns.quad9.net", display: "Quad9", server: "https://dns.quad9.net/dns-query", region: "全球", type: "DoH", priority: 3 },
+  { name: "dns.sb", display: "DNS.SB", server: "https://dns.sb/dns-query", region: "全球", type: "DoH", priority: 4 },
+  { name: "alidns.com", display: "阿里云", server: "https://dns.alidns.com/dns-query", region: "中国", type: "DoH", priority: 5 },
+  { name: "doh.pub", display: "腾讯云", server: "https://doh.pub/dns-query", region: "中国", type: "DoH", priority: 6 },
+  { name: "doh.360.cn", display: "360", server: "https://doh.360.cn/dns-query", region: "中国", type: "DoH", priority: 7 },
+  { name: "dns.adguard-dns.com", display: "AdGuard", server: "https://dns.adguard-dns.com/dns-query", region: "全球", type: "DoH+去广告", priority: 8 },
+  { name: "doh.opendns.com", display: "OpenDNS", server: "https://doh.opendns.com/dns-query", region: "全球", type: "DoH", priority: 9 }
 ];
 
-const enabledProtocols = (process.env.ENABLED_PROTOCOLS || 'doh,dot,tcp,udp').split(',');
 const enabledUpstreamsEnv = process.env.ENABLED_UPSTREAMS || 'all';
-
 let upstreamList = [];
 
 if (enabledUpstreamsEnv === 'all') {
-  upstreamList = upstreamsConfig.filter(u => enabledProtocols.includes(u.protocol));
+  upstreamList = upstreamsConfig;
 } else {
   const enabledNames = enabledUpstreamsEnv.split(',').map(n => n.trim());
   upstreamList = upstreamsConfig.filter(u =>
     enabledNames.includes(u.name) || enabledNames.includes(u.display)
   );
-  if (upstreamList.length === 0) upstreamList = upstreamsConfig.slice(0, 10);
-}
-
-// ============ 查询函数（DoH/DoT/TCP/UDP） ============
-async function queryDoH(server, domain, type, timeout = 10000) {
-  const url = new URL(server);
-  url.searchParams.set("name", domain);
-  url.searchParams.set("type", type);
-
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), timeout);
-
-  try {
-    const response = await fetch(url.toString(), {
-      headers: { 'Accept': 'application/dns-json' },
-      signal: controller.signal
-    });
-    clearTimeout(timeoutId);
-
-    if (response.ok) {
-      const data = await response.json();
-      return { success: true, data: data };
-    }
-  } catch (err) {
-    clearTimeout(timeoutId);
-    throw err;
-  }
-  return { success: false, data: null };
-}
-
-async function queryDoT(server, port, domain, type) {
-  return new Promise((resolve, reject) => {
-    const resolver = new Resolver();
-    resolver.setServers([`${server}:${port}`]);
-
-    const timeout = setTimeout(() => {
-      resolver.cancel();
-      reject(new Error('DoT 查询超时'));
-    }, 5000);
-
-    const dnsType = type === 'A' ? 'A' : type === 'AAAA' ? 'AAAA' : type;
-
-    resolver.resolve(domain, dnsType).then(result => {
-      clearTimeout(timeout);
-      resolve({ success: true, answers: result });
-    }).catch(err => {
-      clearTimeout(timeout);
-      reject(err);
-    });
-  });
-}
-
-async function queryTCP(server, port, domain, type) {
-  return new Promise((resolve, reject) => {
-    const resolver = new Resolver();
-    resolver.setServers([`${server}:${port}`]);
-
-    const timeout = setTimeout(() => {
-      resolver.cancel();
-      reject(new Error('TCP 查询超时'));
-    }, 5000);
-
-    const dnsType = type === 'A' ? 'A' : type === 'AAAA' ? 'AAAA' : type;
-
-    resolver.resolve(domain, dnsType).then(result => {
-      clearTimeout(timeout);
-      resolve({ success: true, answers: result });
-    }).catch(err => {
-      clearTimeout(timeout);
-      reject(err);
-    });
-  });
-}
-
-async function queryUDP(server, port, domain, type) {
-  return new Promise((resolve, reject) => {
-    const resolver = new Resolver();
-    resolver.setServers([`${server}:${port}`]);
-
-    const timeout = setTimeout(() => {
-      resolver.cancel();
-      reject(new Error('UDP 查询超时'));
-    }, 5000);
-
-    const dnsType = type === 'A' ? 'A' : type === 'AAAA' ? 'AAAA' : type;
-
-    resolver.resolve(domain, dnsType).then(result => {
-      clearTimeout(timeout);
-      resolve({ success: true, answers: result });
-    }).catch(err => {
-      clearTimeout(timeout);
-      reject(err);
-    });
-  });
+  if (upstreamList.length === 0) upstreamList = upstreamsConfig.slice(0, 5);
 }
 
 // 构建上游对象
@@ -184,8 +71,6 @@ const upstreams = upstreamList.map((config, index) => ({
   name: config.name,
   displayName: config.display,
   server: config.server,
-  protocol: config.protocol,
-  port: config.port,
   region: config.region,
   type: config.type,
   timeout: config.region === '中国' ? 2000 : 3000,
@@ -194,71 +79,30 @@ const upstreams = upstreamList.map((config, index) => ({
   responseTime: null
 }));
 
-console.log(`\n🌐 配置上游总数: ${upstreams.length}`);
-console.log(`📋 按协议分布:`);
-const protocolCount = {};
-upstreams.forEach(u => { protocolCount[u.protocol] = (protocolCount[u.protocol] || 0) + 1; });
-Object.entries(protocolCount).forEach(([p, c]) => console.log(`   ${p.toUpperCase()}: ${c}个`));
+console.log(`\n🌐 配置 DoH 上游总数: ${upstreams.length}`);
+console.log(`📋 上游列表: ${upstreams.map(u => u.displayName).join(', ')}`);
 
-// 当前选中的上游
 let selectedUpstreamId = null;
 let availableUpstreams = [...upstreams];
 let currentUpstreamIndex = 0;
 let healthCheckRunning = false;
 
-// ============ 增强的过滤函数 ============
-function sanitizeHeaderValue(value) {
-  if (!value) return 'unknown';
-  return String(value).replace(/[^a-zA-Z0-9 \-_.]/g, '').substring(0, 100);
-}
-
-// ============ 获取备用 DoH 端点列表（复用上游配置） ============
-function getDoHEndpoints(upstream, context = 'Wire format') {
-  // 如果当前上游就是 DoH，直接使用它（无需备用）
-  if (upstream.protocol === 'doh') {
-    return [upstream.server];
-  }
-
-  // 否则从所有上游中筛选 DoH 协议且状态为在线的上游
-  const dohServers = upstreams
-    .filter(u => u.protocol === 'doh' && u.status === 'online')
-    .map(u => u.server)
-    .filter((v, i, a) => a.indexOf(v) === i); // 去重
-
-  if (dohServers.length > 0) {
-    console.log(`${context} 使用上游配置中的 DoH 备用列表: ${dohServers.join(', ')}`);
-    return dohServers;
-  }
-
-  // 如果没有任何 DoH 上游在线，回退到硬编码列表（保证服务可用）
-  const fallback = ['https://cloudflare-dns.com/dns-query', 'https://dns.alidns.com/dns-query', 'https://dns.google/dns-query'];
-  console.log(`${context} 无 DoH 上游在线，使用硬编码备用列表: ${fallback.join(', ')}`);
-  return fallback;
-}
-
-// 健康检查
+// ============ 健康检查 ============
 async function checkSingleUpstream(upstream) {
   const startTime = Date.now();
   try {
-    let result;
-    switch (upstream.protocol) {
-      case 'doh':
-        result = await queryDoH(upstream.server, 'google.com', 'A');
-        break;
-      case 'dot':
-        result = await queryDoT(upstream.server, upstream.port, 'google.com', 'A');
-        break;
-      case 'tcp':
-        result = await queryTCP(upstream.server, upstream.port, 'google.com', 'A');
-        break;
-      case 'udp':
-        result = await queryUDP(upstream.server, upstream.port, 'google.com', 'A');
-        break;
-      default:
-        throw new Error('未知协议');
-    }
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), upstream.timeout + 2000);
+    const url = new URL(upstream.server);
+    url.searchParams.set('name', 'google.com');
+    url.searchParams.set('type', 'A');
+    const response = await fetch(url.toString(), {
+      headers: { 'Accept': 'application/dns-json' },
+      signal: controller.signal
+    });
+    clearTimeout(timeoutId);
 
-    const isOnline = result.success && (result.data?.Answer?.length > 0 || result.answers?.length > 0);
+    const isOnline = response.ok;
     upstream.status = isOnline ? 'online' : 'offline';
     upstream.lastCheck = new Date().toISOString();
     upstream.responseTime = isOnline ? Date.now() - startTime : null;
@@ -270,9 +114,9 @@ async function checkSingleUpstream(upstream) {
     }
 
     if (isOnline) {
-      console.log(`✅ ${upstream.displayName} (${upstream.protocol.toUpperCase()}) - ${upstream.responseTime}ms`);
+      console.log(`✅ ${upstream.displayName} - ${upstream.responseTime}ms`);
     } else {
-      console.log(`❌ ${upstream.displayName} (${upstream.protocol.toUpperCase()}) - 不可用`);
+      console.log(`❌ ${upstream.displayName} - 不可用`);
     }
     return isOnline;
   } catch (err) {
@@ -280,7 +124,7 @@ async function checkSingleUpstream(upstream) {
     upstream.lastCheck = new Date().toISOString();
     upstream.responseTime = null;
     availableUpstreams = availableUpstreams.filter(u => u.id !== upstream.id);
-    console.log(`❌ ${upstream.displayName} (${upstream.protocol.toUpperCase()}) - ${err.message}`);
+    console.log(`❌ ${upstream.displayName} - 不可用 (${err.message})`);
     return false;
   }
 }
@@ -327,77 +171,40 @@ function getCurrentUpstream() {
   return upstreams[0];
 }
 
-// ============ 核心查询函数（含 HTTPS 记录回退） ============
-async function queryDNS(upstream, domain, type) {
-  if (type === 'HTTPS') {
-    const endpoints = getDoHEndpoints(upstream, 'HTTPS');
-    let lastError = null;
-    for (const server of endpoints) {
-      try {
-        const result = await queryDoH(server, domain, type);
-        if (result.success && result.data) {
-          return { success: true, data: result.data };
-        }
-      } catch (err) {
-        lastError = err;
-        console.log(`HTTPS 查询失败 (${server}): ${err.message}`);
-        continue;
-      }
-    }
-    console.error(`HTTPS 查询所有备用 DoH 均失败: ${lastError?.message}`);
-    return { success: false, data: null };
-  }
+// ============ 核心查询函数 ============
+async function queryDoH(server, domain, type, timeout = 10000) {
+  const url = new URL(server);
+  url.searchParams.set("name", domain);
+  url.searchParams.set("type", type);
 
-  switch (upstream.protocol) {
-    case 'doh': {
-      const result = await queryDoH(upstream.server, domain, type);
-      if (result.success && result.data) {
-        return { success: true, data: result.data };
-      }
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeout);
+
+  try {
+    const response = await fetch(url.toString(), {
+      headers: { 'Accept': 'application/dns-json' },
+      signal: controller.signal
+    });
+    clearTimeout(timeoutId);
+
+    if (response.ok) {
+      const data = await response.json();
+      return { success: true, data };
+    } else {
       return { success: false, data: null };
     }
-    case 'dot': {
-      const result = await queryDoT(upstream.server, upstream.port, domain, type);
-      if (result.success) {
-        const answers = result.answers || [];
-        return {
-          success: true,
-          data: {
-            Answer: answers.map(a => ({ type: recordTypeMap[type] || 1, data: a }))
-          }
-        };
-      }
-      return { success: false, data: null };
-    }
-    case 'tcp': {
-      const result = await queryTCP(upstream.server, upstream.port, domain, type);
-      if (result.success) {
-        const answers = result.answers || [];
-        return {
-          success: true,
-          data: {
-            Answer: answers.map(a => ({ type: recordTypeMap[type] || 1, data: a }))
-          }
-        };
-      }
-      return { success: false, data: null };
-    }
-    case 'udp': {
-      const result = await queryUDP(upstream.server, upstream.port, domain, type);
-      if (result.success) {
-        const answers = result.answers || [];
-        return {
-          success: true,
-          data: {
-            Answer: answers.map(a => ({ type: recordTypeMap[type] || 1, data: a }))
-          }
-        };
-      }
-      return { success: false, data: null };
-    }
-    default:
-      throw new Error(`未知协议: ${upstream.protocol}`);
+  } catch (err) {
+    clearTimeout(timeoutId);
+    throw err;
   }
+}
+
+async function queryDNS(upstream, domain, type) {
+  const result = await queryDoH(upstream.server, domain, type, upstream.timeout);
+  if (result.success && result.data) {
+    return { success: true, data: result.data };
+  }
+  return { success: false, data: null };
 }
 
 async function queryWithFallback(domain, type, retryCount = 0) {
@@ -407,7 +214,7 @@ async function queryWithFallback(domain, type, retryCount = 0) {
   try {
     const result = await queryDNS(upstream, domain, type);
     if (result.success && result.data && (result.data.Answer?.length > 0)) {
-      return { success: true, data: result.data, upstream: upstream.displayName, protocol: upstream.protocol };
+      return { success: true, data: result.data, upstream: upstream.displayName };
     }
   } catch (err) {
     console.log(`${upstream.displayName} 查询失败: ${err.message}`);
@@ -443,7 +250,6 @@ function getCurrentStatus() {
       id: u.id,
       name: u.name,
       displayName: u.displayName,
-      protocol: u.protocol,
       region: u.region,
       type: u.type,
       status: u.status,
@@ -455,11 +261,7 @@ function getCurrentStatus() {
     selectedId: selectedUpstreamId,
     currentUpstream: getCurrentUpstream().displayName,
     availableCount: availableUpstreams.length,
-    totalCount: upstreams.length,
-    protocolStats: availableUpstreams.reduce((acc, u) => {
-      acc[u.protocol] = (acc[u.protocol] || 0) + 1;
-      return acc;
-    }, {})
+    totalCount: upstreams.length
   };
 }
 
@@ -740,17 +542,6 @@ app.get('/admin', requireAdmin, (req, res) => {
     .status-online { color: #4caf50; font-weight: bold; }
     .status-offline { color: #f44336; font-weight: bold; }
     .status-checking { color: #ff9800; }
-    .protocol-badge {
-      display: inline-block;
-      padding: 2px 8px;
-      border-radius: 12px;
-      font-size: 10px;
-      font-weight: bold;
-    }
-    .protocol-doh { background: #e3f2fd; color: #1976d2; }
-    .protocol-dot { background: #e8f5e9; color: #388e3c; }
-    .protocol-tcp { background: #fff3e0; color: #f57c00; }
-    .protocol-udp { background: #fce4ec; color: #c2185b; }
     .switch-btn {
       padding: 4px 12px;
       border: none;
@@ -826,7 +617,7 @@ app.get('/admin', requireAdmin, (req, res) => {
       <div style="overflow-x: auto;">
         <table class="upstream-table">
           <thead>
-            <tr><th>状态</th><th>上游服务器</th><th>协议</th><th>区域</th><th>响应时间</th><th>操作</th></tr>
+            <tr><th>状态</th><th>上游服务器</th><th>区域</th><th>响应时间</th><th>操作</th></tr>
           </thead>
           <tbody id="upstreamList"></tbody>
         </table>
@@ -862,11 +653,6 @@ app.get('/admin', requireAdmin, (req, res) => {
       }
     }
 
-    function getProtocolClass(protocol) {
-      const map = { doh: 'protocol-doh', dot: 'protocol-dot', tcp: 'protocol-tcp', udp: 'protocol-udp' };
-      return map[protocol] || 'protocol-doh';
-    }
-
     function renderUpstreams(upstreams, mode, selectedId) {
       const tbody = document.getElementById('upstreamList');
       if (!tbody) return;
@@ -900,16 +686,13 @@ app.get('/admin', requireAdmin, (req, res) => {
         }
         nameCell.innerHTML = nameHtml;
 
-        const protocolCell = row.insertCell(2);
-        protocolCell.innerHTML = '<span class="protocol-badge ' + getProtocolClass(u.protocol) + '">' + u.protocol.toUpperCase() + '</span>';
-
-        const regionCell = row.insertCell(3);
+        const regionCell = row.insertCell(2);
         regionCell.innerHTML = u.region || '全球';
 
-        const timeCell = row.insertCell(4);
+        const timeCell = row.insertCell(3);
         timeCell.innerHTML = u.responseTime ? u.responseTime + 'ms' : '-';
 
-        const actionCell = row.insertCell(5);
+        const actionCell = row.insertCell(4);
         if (u.status === 'online') {
           const switchBtn = document.createElement('button');
           if (mode === 'manual' && selectedId !== null && u.id === selectedId) {
@@ -1002,7 +785,7 @@ app.post('/api/switch/:id', requireAdmin, (req, res) => {
   if (upstream && upstream.status === 'online') {
     selectedUpstreamId = id;
     currentUpstreamIndex = 0;
-    console.log(`🔧 手动切换到: ${upstream.displayName} (${upstream.protocol.toUpperCase()})`);
+    console.log(`🔧 手动切换到: ${upstream.displayName}`);
     res.json({ success: true, upstream: upstream.displayName });
   } else {
     res.json({ success: false, message: '上游不可用' });
@@ -1021,7 +804,6 @@ app.post('/api/healthcheck', requireAdmin, async (req, res) => {
   res.json({ success: true });
 });
 
-// ============ 公开 API ============
 app.get('/api/upstreams', (req, res) => {
   res.json(getCurrentStatus());
 });
@@ -1048,7 +830,6 @@ app.get('/api/dns', async (req, res) => {
         return res.json({
           Status: formatted.Status,
           upstream: result.upstream,
-          protocol: result.protocol,
           ...formatted
         });
       } else {
@@ -1067,7 +848,7 @@ app.get('/api/dns', async (req, res) => {
   }
 });
 
-// ============ DoH 端点（支持 wire format，备用 DoH 复用上游配置） ============
+// ============ DoH 端点 ============
 app.all(`/${DoH路径}`, async (req, res) => {
   const { method, headers, body } = req;
   const UA = headers['user-agent'] || 'DoH Client';
@@ -1080,8 +861,7 @@ app.all(`/${DoH路径}`, async (req, res) => {
     let type = 'A';
     let response = null;
 
-    // 辅助函数：尝试多个 DoH 端点进行 wire format 请求
-    async function tryWireFormat(endpoints, requestUrl, options) {
+    async function tryMultipleDoHEndpoints(endpoints, requestUrl, options) {
       let lastError = null;
       for (const endpoint of endpoints) {
         try {
@@ -1093,22 +873,21 @@ app.all(`/${DoH路径}`, async (req, res) => {
           lastError = err;
         }
       }
-      throw lastError || new Error('所有备用 DoH 均失败');
+      throw lastError || new Error('所有 DoH 端点均失败');
     }
 
-    // ---------- GET 请求 ----------
     if (method === 'GET') {
       const url = new URL(req.url, `http://${req.headers.host}`);
 
-      // 处理 ?name= 参数（JSON 或 wire format）
       if (url.searchParams.has('name')) {
         domain = url.searchParams.get('name');
         type = url.searchParams.get('type') || 'A';
 
         if (accept.includes('application/dns-message')) {
-          const endpoints = getDoHEndpoints(upstream, 'Wire format');
+          const endpoints = upstreams.filter(u => u.status === 'online').map(u => u.server);
+          if (endpoints.length === 0) endpoints.push(upstream.server);
           const queryString = `?name=${encodeURIComponent(domain)}&type=${encodeURIComponent(type)}`;
-          const wireResponse = await tryWireFormat(
+          const wireResponse = await tryMultipleDoHEndpoints(
             endpoints,
             queryString,
             { headers: { 'Accept': 'application/dns-message', 'User-Agent': UA } }
@@ -1121,7 +900,6 @@ app.all(`/${DoH路径}`, async (req, res) => {
           return res.status(wireResponse.status).send(wireBody);
         }
 
-        // 默认返回 JSON
         const result = await queryDNS(upstream, domain, type);
         if (result.success && result.data) {
           const formatted = formatDNSResponse(result.data, domain, type);
@@ -1138,12 +916,12 @@ app.all(`/${DoH路径}`, async (req, res) => {
         }
       }
 
-      // 处理 ?dns= 参数（Base64URL 编码的 wire data）
       if (url.searchParams.has('dns')) {
-        const endpoints = getDoHEndpoints(upstream, 'Wire format');
+        const endpoints = upstreams.filter(u => u.status === 'online').map(u => u.server);
+        if (endpoints.length === 0) endpoints.push(upstream.server);
         const base64url = url.searchParams.get('dns');
         const queryString = `?dns=${encodeURIComponent(base64url)}`;
-        const wireResponse = await tryWireFormat(
+        const wireResponse = await tryMultipleDoHEndpoints(
           endpoints,
           queryString,
           { headers: { 'Accept': 'application/dns-message', 'User-Agent': UA } }
@@ -1160,7 +938,6 @@ app.all(`/${DoH路径}`, async (req, res) => {
       return res.status(400).json({ error: '缺少参数 name 或 dns' });
     }
 
-    // ---------- POST 请求 ----------
     else if (method === 'POST') {
       let rawBody = '';
       if (Buffer.isBuffer(body)) {
@@ -1200,8 +977,8 @@ app.all(`/${DoH路径}`, async (req, res) => {
           return res.status(400).json({ error: '无效的表单格式' });
         }
       } else if (contentType.includes('application/dns-message')) {
-        // 直接转发 wire format POST
-        const endpoints = getDoHEndpoints(upstream, 'Wire format');
+        const endpoints = upstreams.filter(u => u.status === 'online').map(u => u.server);
+        if (endpoints.length === 0) endpoints.push(upstream.server);
         const options = {
           method: 'POST',
           headers: {
@@ -1225,7 +1002,7 @@ app.all(`/${DoH路径}`, async (req, res) => {
           }
         }
         if (!response) {
-          throw lastError || new Error('所有备用 DoH POST 失败');
+          throw lastError || new Error('所有 DoH POST 失败');
         }
       } else if (rawBody.trim().startsWith('{')) {
         try {
@@ -1247,12 +1024,12 @@ app.all(`/${DoH路径}`, async (req, res) => {
         }
       }
 
-      // 如果解析出了 domain，执行查询
       if (domain && !response) {
         if (accept.includes('application/dns-message')) {
-          const endpoints = getDoHEndpoints(upstream, 'Wire format');
+          const endpoints = upstreams.filter(u => u.status === 'online').map(u => u.server);
+          if (endpoints.length === 0) endpoints.push(upstream.server);
           const queryString = `?name=${encodeURIComponent(domain)}&type=${encodeURIComponent(type)}`;
-          const wireResponse = await tryWireFormat(
+          const wireResponse = await tryMultipleDoHEndpoints(
             endpoints,
             queryString,
             { headers: { 'Accept': 'application/dns-message', 'User-Agent': UA } }
@@ -1291,7 +1068,6 @@ app.all(`/${DoH路径}`, async (req, res) => {
       }
     }
 
-    // ---------- 转发 wire format 响应（POST 透传） ----------
     if (response) {
       if (!response.ok) throw new Error(`DoH 返回错误 (${response.status})`);
       const arrayBuffer = await response.arrayBuffer();
@@ -1406,17 +1182,6 @@ app.get('/', (req, res) => {
     .status-online { color: #4caf50; font-weight: bold; }
     .status-offline { color: #f44336; font-weight: bold; }
     .status-checking { color: #ff9800; }
-    .protocol-badge {
-      display: inline-block;
-      padding: 2px 8px;
-      border-radius: 12px;
-      font-size: 10px;
-      font-weight: bold;
-    }
-    .protocol-doh { background: #e3f2fd; color: #1976d2; }
-    .protocol-dot { background: #e8f5e9; color: #388e3c; }
-    .protocol-tcp { background: #fff3e0; color: #f57c00; }
-    .protocol-udp { background: #fce4ec; color: #c2185b; }
     .query-box {
       display: flex;
       gap: 10px;
@@ -1511,12 +1276,23 @@ app.get('/', (req, res) => {
       padding: 15px;
       border-radius: 8px;
       font-family: monospace;
-      font-size: 12px;
+      font-size: 13px;
       overflow-x: auto;
-    }
-    .curl-example pre {
-      margin: 0;
       white-space: pre-wrap;
+      word-break: break-all;
+      margin: 8px 0;
+    }
+    .curl-example a {
+      color: #66d9ef;
+    }
+    .tag {
+      display: inline-block;
+      background: #667eea;
+      color: white;
+      font-size: 12px;
+      padding: 2px 10px;
+      border-radius: 12px;
+      margin-right: 6px;
     }
     @media (max-width: 768px) {
       .upstream-table { font-size: 12px; }
@@ -1538,7 +1314,7 @@ app.get('/', (req, res) => {
       </div>
     </div>
     <div class="header-description">
-      <p>多协议 (DoH/DoT/TCP/UDP) | 多记录类型 | 隐私保护</p>
+      <p>纯 DoH 服务 | 多记录类型 | 支持 GET/POST & Wire Format</p>
     </div>
 
     <div class="card">
@@ -1553,7 +1329,7 @@ app.get('/', (req, res) => {
       <div style="overflow-x: auto;">
         <table class="upstream-table">
           <thead>
-            <tr><th>状态</th><th>上游服务器</th><th>协议</th><th>区域</th><th>响应时间</th></tr>
+            <tr><th>状态</th><th>上游服务器</th><th>区域</th><th>响应时间</th></tr>
           </thead>
           <tbody id="upstreamList"></tbody>
         </table>
@@ -1579,33 +1355,111 @@ app.get('/', (req, res) => {
       <div id="result" class="result"></div>
     </div>
 
+    <!-- ========== 完整的“使用示例”卡片（简洁风格） ========== -->
     <div class="card">
       <h2>📖 使用示例</h2>
-      <div class="curl-example">
-        <pre><strong># GET 请求 - A记录 (IPv4)</strong>
+      <div style="font-size:14px; margin-bottom:12px; color:#555;">
+        以下命令中的端点 <code>${currentDohUrl}</code> 已自动替换为您的实际地址，可直接复制运行。
+      </div>
+
+      <!-- 1. GET JSON -->
+      <div style="margin-bottom:16px; border-left:3px solid #667eea; padding-left:12px;">
+        <div style="font-weight:bold; color:#667eea;">1️⃣ GET 请求 – JSON 格式（?name=）</div>
+        <div class="curl-example"># A 记录 (IPv4)
 curl -H "accept: application/dns-json" \\
   "${currentDohUrl}?name=google.com&type=A"
 
-<strong># GET 请求 - HTTPS记录 (ECH配置)</strong>
+# AAAA 记录 (IPv6)
 curl -H "accept: application/dns-json" \\
-  "${currentDohUrl}?name=cloudflare-ech.com&type=HTTPS"
+  "${currentDohUrl}?name=google.com&type=AAAA"
 
-<strong># POST 请求 - JSON格式 (A记录)</strong>
+# HTTPS 记录 (ECH 配置)
+curl -H "accept: application/dns-json" \\
+  "${currentDohUrl}?name=cloudflare-ech.com&type=HTTPS"</div>
+        <div style="font-size:13px; color:#666;">预期：返回 JSON，Answer 中包含对应记录。</div>
+      </div>
+
+      <!-- 2. GET Wire Format -->
+      <div style="margin-bottom:16px; border-left:3px solid #667eea; padding-left:12px;">
+        <div style="font-weight:bold; color:#667eea;">2️⃣ GET 请求 – Wire Format（?dns=）</div>
+        <div class="curl-example"># 查询 google.com A 记录（Base64URL 编码示例）
+curl -H "accept: application/dns-message" \\
+  "${currentDohUrl}?dns=AAABAAABAAAAAAAAB2V4YW1wbGUDY29tAAABAAE"</div>
+        <div style="font-size:13px; color:#666;">
+          预期：返回二进制 DNS 数据（终端会显示乱码，这是正常的）。<br>
+          验证响应头：<code>content-type: application/dns-message</code>
+        </div>
+      </div>
+
+      <!-- 3. POST JSON -->
+      <div style="margin-bottom:16px; border-left:3px solid #667eea; padding-left:12px;">
+        <div style="font-weight:bold; color:#667eea;">3️⃣ POST 请求 – JSON Body</div>
+        <div class="curl-example"># A 记录查询
 curl -X POST -H "Content-Type: application/dns-json" \\
   -d '{"name":"google.com","type":"A"}' \\
   "${currentDohUrl}"
 
-<strong># POST 请求 - 表单格式 (A记录)</strong>
-curl -X POST -H "Content-Type: application/x-www-form-urlencoded" \\
+# HTTPS 记录查询
+curl -X POST -H "Content-Type: application/dns-json" \\
+  -d '{"name":"cloudflare-ech.com","type":"HTTPS"}' \\
+  "${currentDohUrl}"</div>
+        <div style="font-size:13px; color:#666;">预期：返回 JSON，Answer 中包含记录。</div>
+      </div>
+
+      <!-- 4. POST 表单 -->
+      <div style="margin-bottom:16px; border-left:3px solid #667eea; padding-left:12px;">
+        <div style="font-weight:bold; color:#667eea;">4️⃣ POST 请求 – 表单格式</div>
+        <div class="curl-example">curl -X POST -H "Content-Type: application/x-www-form-urlencoded" \\
   -d "name=google.com&type=A" \\
-  "${currentDohUrl}"
+  "${currentDohUrl}"</div>
+        <div style="font-size:13px; color:#666;">预期：返回 JSON，Answer 中包含 IPv4 地址。</div>
+      </div>
 
-<strong># 浏览器访问 (直接显示JSON)</strong>
-<a href="${currentDohUrl}?name=google.com&type=A" target="_blank">${currentDohUrl}?name=google.com&type=A</a>
+      <!-- 5. POST Wire Format -->
+      <div style="margin-bottom:16px; border-left:3px solid #667eea; padding-left:12px;">
+        <div style="font-weight:bold; color:#667eea;">5️⃣ POST 请求 – Wire Format（原始二进制）</div>
+        <div class="curl-example"># 使用 Python 生成二进制查询数据（需安装 Python使用pip install dnspython或pip3 install dnspython命令安装Python）
+python3 -c "import dns.message; q = dns.message.make_query('google.com', 'A'); open('query.bin','wb').write(q.to_wire())"
 
-<strong># 浏览器配置 DoH</strong>
-Chrome/Edge: 设置 → 隐私和安全 → 安全 → 使用安全 DNS → 自定义
-填入: <strong>${currentDohUrl}</strong></pre>
+# 发送二进制数据
+curl -X POST -H "Content-Type: application/dns-message" \\
+  --data-binary @query.bin \\
+  "${currentDohUrl}"</div>
+        <div style="font-size:13px; color:#666;">
+          预期：返回二进制 DNS 响应（终端显示乱码）。<br>
+          验证响应头：<code>content-type: application/dns-message</code>
+        </div>
+      </div>
+
+      <!-- 浏览器配置 -->
+      <div style="border-top:1px solid #e0e0e0; padding-top:12px; margin-top:8px;">
+        <div style="font-weight:bold; color:#667eea;">🌐 浏览器访问 & 配置 DoH</div>
+        <div class="curl-example" style="background:#f0f0f0; color:#333;">
+          # 浏览器直接访问（显示 JSON）
+          <a href="${currentDohUrl}?name=google.com&type=A" target="_blank">${currentDohUrl}?name=google.com&type=A</a>
+
+          # Chrome/Edge 配置 DoH
+          设置 → 隐私和安全 → 安全 → 使用安全 DNS → 自定义
+          填入：<strong>${currentDohUrl}</strong>
+        </div>
+      </div>
+
+      <!-- 诊断命令 -->
+      <div style="margin-top:12px; border-top:1px solid #e0e0e0; padding-top:12px;">
+        <div style="font-weight:bold; color:#667eea;">🔍 诊断辅助命令</div>
+        <div class="curl-example" style="background:#f0f0f0; color:#333;">
+# 查看完整响应头（确认 Content-Type）
+curl -I "${currentDohUrl}?name=google.com&type=A"
+
+# 查看 wire format 响应头
+curl -I -H "accept: application/dns-message" \\
+  "${currentDohUrl}?dns=AAABAAABAAAAAAAAB2V4YW1wbGUDY29tAAABAAE"
+
+# 保存 wire format 响应到文件（避免终端乱码）
+curl -H "accept: application/dns-message" \\
+  "${currentDohUrl}?dns=AAABAAABAAAAAAAAB2V4YW1wbGUDY29tAAABAAE" \\
+  --output response.bin
+</div>
       </div>
     </div>
 
@@ -1628,11 +1482,6 @@ Chrome/Edge: 设置 → 隐私和安全 → 安全 → 使用安全 DNS → 自�
         console.error('加载失败:', err);
         setTimeout(loadUpstreams, 3000);
       }
-    }
-
-    function getProtocolClass(protocol) {
-      const map = { doh: 'protocol-doh', dot: 'protocol-dot', tcp: 'protocol-tcp', udp: 'protocol-udp' };
-      return map[protocol] || 'protocol-doh';
     }
 
     function renderUpstreams(upstreams, mode, selectedId) {
@@ -1668,13 +1517,10 @@ Chrome/Edge: 设置 → 隐私和安全 → 安全 → 使用安全 DNS → 自�
         }
         nameCell.innerHTML = nameHtml;
 
-        const protocolCell = row.insertCell(2);
-        protocolCell.innerHTML = '<span class="protocol-badge ' + getProtocolClass(u.protocol) + '">' + u.protocol.toUpperCase() + '</span>';
-
-        const regionCell = row.insertCell(3);
+        const regionCell = row.insertCell(2);
         regionCell.innerHTML = u.region || '全球';
 
-        const timeCell = row.insertCell(4);
+        const timeCell = row.insertCell(3);
         timeCell.innerHTML = u.responseTime ? u.responseTime + 'ms' : '-';
       });
     }
@@ -1779,6 +1625,7 @@ Chrome/Edge: 设置 → 隐私和安全 → 安全 → 使用安全 DNS → 自�
   res.send(html);
 });
 
+// ============ 健康检查端点 ============
 app.get('/health', (req, res) => {
   const status = getCurrentStatus();
   setJsonHeaders(res);
@@ -1789,18 +1636,20 @@ app.get('/health', (req, res) => {
     mode: status.mode,
     currentUpstream: status.currentUpstream,
     available: status.availableCount,
-    total: status.totalCount
+    total: status.totalCount,
+    protocols: ['DoH']
   });
 });
 
+// 启动服务器
 app.listen(PORT, '0.0.0.0', async () => {
   console.log(`========================================`);
-  console.log(`🛡️ 多协议 DoH 服务器已启动`);
+  console.log(`🛡️ 纯 DoH 服务器已启动`);
   console.log(`📡 端口: ${PORT}`);
   console.log(`🔗 DoH 端点: /${DoH路径}`);
   console.log(`🔐 管理员入口: /admin`);
   console.log(`📋 默认账号: ${ADMIN_USER} / ${ADMIN_PASS}`);
-  console.log(`🌐 上游总数: ${upstreams.length}`);
+  console.log(`🌐 DoH 上游总数: ${upstreams.length}`);
   console.log(`========================================`);
 
   await healthCheck();
