@@ -1,7 +1,7 @@
 {
   "name": "doh-server",
   "version": "1.0.0",
-  "description": "Pure DoH Server with Admin Panel",
+  "description": "DNS-over-HTTPS server",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
@@ -9,5 +9,8 @@
   "dependencies": {
     "express": "^4.18.2",
     "express-session": "^1.17.3"
+  },
+  "engines": {
+    "node": ">=18"
   }
 }
