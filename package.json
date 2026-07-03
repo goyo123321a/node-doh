@@ -1,16 +1,13 @@
 {
   "name": "doh-server",
   "version": "1.0.0",
-  "description": "DNS over HTTPS Server - Multi-Protocol Multi-Upstream",
+  "description": "Pure DoH Server with Admin Panel",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
     "express": "^4.18.2",
-    "express-session": "^1.18.0"
-  },
-  "engines": {
-    "node": ">=18.x"
+    "express-session": "^1.17.3"
   }
 }
