@@ -86,6 +86,13 @@ curl -X POST -H "Content-Type: application/x-www-form-urlencoded" \
   "https://zwmztkpw-wzvigdwr.hf.space/123a"
 ```
 
+# POST 请求 – Wire Format（原始二进制）
+```bash
+echo -n "AAABAAABAAAAAAAAB2V4YW1wbGUDY29tAAABAAE" | base64 -d > query.bin
+curl -X POST -H "Content-Type: application/dns-message" --data-binary @query.bin \
+  "https://cfdoh.lmaqn.de5.net/cf-doh"
+```
+
 # 浏览器访问 (直接显示JSON)
 https://zwmztkpw-wzvigdwr.hf.space/123a?name=google.com&type=A
 
