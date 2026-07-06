@@ -1417,13 +1417,10 @@ curl -X POST -H "Content-Type: application/dns-json" \\
 
       <!-- 5. POST Wire Format -->
       <div style="margin-bottom:16px; border-left:3px solid #667eea; padding-left:12px;">
-        <div style="font-weight:bold; color:#667eea;">5️⃣ POST 请求 – Wire Format（原始二进制）</div>
-        <div class="curl-example"># 使用 Python 生成二进制查询数据（需安装 Python使用pip install dnspython或pip3 install dnspython命令安装Python）
-python3 -c "import dns.message; q = dns.message.make_query('google.com', 'A'); open('query.bin','wb').write(q.to_wire())"
-
+        <div style="font-weight:bold; color:#667eea;">5️⃣ POST 请求 – Wire Format（原始二进制）
 # 发送二进制数据
-curl -X POST -H "Content-Type: application/dns-message" \\
-  --data-binary @query.bin \\
+echo -n "AAABAAABAAAAAAAAB2V4YW1wbGUDY29tAAABAAE" | base64 -d > query.bin
+curl -X POST -H "Content-Type: application/dns-message" --data-binary @query.bin \\
   "${currentDohUrl}"</div>
         <div style="font-size:13px; color:#666;">
           预期：返回二进制 DNS 响应（终端显示乱码）。<br>
