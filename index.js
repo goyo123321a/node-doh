@@ -1,1659 +1,993 @@
-const express = require('express');
-const session = require('express-session');
+#!/usr/bin/env bash
 
-const app = express();
-const PORT = process.env.PORT || 7860;
+#===========================================
+# GOST 一键管理脚本 (v2 & v3 通用)
+#===========================================
 
-// ============ 管理员配置 ============
-const ADMIN_USER = process.env.ADMIN_USER || 'admin';
-const ADMIN_PASS = process.env.ADMIN_PASS || '123321';
-const SESSION_SECRET = process.env.SESSION_SECRET || 'doh-server-secret-key';
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
 
-// ============ Session 配置 ============
-app.use(session({
-  secret: SESSION_SECRET,
-  resave: false,
-  saveUninitialized: false,
-  cookie: { secure: false, maxAge: 24 * 60 * 60 * 1000 }
-}));
+SUBFILE="$HOME/sub.txt"
 
-// ============ DoH 路径配置 ============
-let DoH路径 = process.env.DOH_PATH || process.env.TOKEN || 'dns-query';
+# ---------- 前置检查 ----------
+check_required_tools() {
+    if ! command -v wget >/dev/null 2>&1 && ! command -v curl >/dev/null 2>&1; then
+        echo -e "${RED}错误: 需要 wget 或 curl，请安装后重试。${NC}"
+        exit 1
+    fi
+}
+check_required_tools
 
-if (DoH路径.includes("/")) {
-  const parts = DoH路径.split("/");
-  DoH路径 = parts[parts.length - 1];
+flush_input() {
+    local leftover
+    while read -r -t 0.01 leftover 2>/dev/null; do :; done
+    read -t 0.1 -n 10000 leftover 2>/dev/null
 }
 
-if (!DoH路径 || DoH路径.length === 0 || DoH路径 === 'undefined') {
-  DoH路径 = 'dns-query';
+get_local_ip() {
+    local ip=$(ip -4 addr show 2>/dev/null | grep -o 'inet [0-9.]*' | grep -v '127.0.0.1' | head -1 | cut -d' ' -f2)
+    if [ -z "$ip" ]; then
+        ip=$(hostname -i 2>/dev/null | awk '{print $1}')
+    fi
+    if [ -z "$ip" ] || [ "$ip" = "127.0.0.1" ]; then
+        ip="$(hostname)"
+    fi
+    echo "$ip"
 }
 
-DoH路径 = DoH路径.replace(/[^a-zA-Z0-9\-_]/g, '');
+setup_workspace() {
+    CURRENT_USER=$(whoami)
+    if [[ "$CURRENT_USER" == "root" ]]; then
+        if [[ -n "$SUDO_USER" ]]; then NORMAL_USER="$SUDO_USER"
+        elif [[ -n "$USER" ]] && [[ "$USER" != "root" ]]; then NORMAL_USER="$USER"
+        else NORMAL_USER=$(awk -F: '$3>=1000 && $3<65534 {print $1; exit}' /etc/passwd 2>/dev/null)
+        fi
+        WORK_HOME="/home/$NORMAL_USER"
+        [[ -z "$NORMAL_USER" ]] && WORK_HOME="$PWD"
+    else
+        WORK_HOME="$HOME"
+    fi
+    GOST_DIR="$WORK_HOME/GOST"
+    mkdir -p "$GOST_DIR" 2>/dev/null || { GOST_DIR="/tmp/GOST_${CURRENT_USER}"; mkdir -p "$GOST_DIR"; }
+    GOST_BIN="$GOST_DIR/gost"
+    GOST_LOG="$GOST_DIR/gost.log"
+    GOST_PID_FILE="$GOST_DIR/gost.pid"
+    GOST_CMD_FILE="$GOST_DIR/start_cmd.txt"
+    echo -e "${GREEN}工作目录: ${GOST_DIR}${NC}"
+}
+setup_workspace
 
-console.log(`📡 DoH 端点路径: /${DoH路径}`);
-
-// ============ DNS 记录类型映射 ============
-const recordTypeMap = {
-  'A': 1, 'AAAA': 28, 'CNAME': 5, 'MX': 15, 'TXT': 16, 'NS': 2,
-  'SOA': 6, 'PTR': 12, 'SRV': 33, 'CAA': 257, 'HTTPS': 65, 'ANY': 255
-};
-
-// ============ 仅 DoH 上游配置 ============
-const upstreamsConfig = [
-  { name: "cloudflare-dns.com", display: "Cloudflare", server: "https://cloudflare-dns.com/dns-query", region: "全球", type: "DoH", priority: 1 },
-  { name: "dns.google", display: "Google", server: "https://dns.google/dns-query", region: "全球", type: "DoH", priority: 2 },
-  { name: "dns.quad9.net", display: "Quad9", server: "https://dns.quad9.net/dns-query", region: "全球", type: "DoH", priority: 3 },
-  { name: "dns.sb", display: "DNS.SB", server: "https://dns.sb/dns-query", region: "全球", type: "DoH", priority: 4 },
-  { name: "alidns.com", display: "阿里云", server: "https://dns.alidns.com/dns-query", region: "中国", type: "DoH", priority: 5 },
-  { name: "doh.pub", display: "腾讯云", server: "https://doh.pub/dns-query", region: "中国", type: "DoH", priority: 6 },
-  { name: "doh.360.cn", display: "360", server: "https://doh.360.cn/dns-query", region: "中国", type: "DoH", priority: 7 },
-  { name: "dns.adguard-dns.com", display: "AdGuard", server: "https://dns.adguard-dns.com/dns-query", region: "全球", type: "DoH+去广告", priority: 8 },
-  { name: "doh.opendns.com", display: "OpenDNS", server: "https://doh.opendns.com/dns-query", region: "全球", type: "DoH", priority: 9 }
-];
-
-const enabledUpstreamsEnv = process.env.ENABLED_UPSTREAMS || 'all';
-let upstreamList = [];
-
-if (enabledUpstreamsEnv === 'all') {
-  upstreamList = upstreamsConfig;
-} else {
-  const enabledNames = enabledUpstreamsEnv.split(',').map(n => n.trim());
-  upstreamList = upstreamsConfig.filter(u =>
-    enabledNames.includes(u.name) || enabledNames.includes(u.display)
-  );
-  if (upstreamList.length === 0) upstreamList = upstreamsConfig.slice(0, 5);
+detect_os_arch() {
+    case "$(uname -s)" in
+        Linux)     os="linux" ;;
+        FreeBSD)   os="freebsd" ;;
+        Darwin)    os="darwin" ;;
+        *)         os="linux" ;;
+    esac
+    case "$(uname -m)" in
+        x86_64|amd64)      cpu_arch="amd64" ;;
+        aarch64|arm64)     cpu_arch="arm64" ;;
+        armv7l|armv7)      cpu_arch="armv7" ;;
+        i686|i386)         cpu_arch="386" ;;
+        *)                 cpu_arch="amd64" ;;
+    esac
 }
 
-// 构建上游对象
-const upstreams = upstreamList.map((config, index) => ({
-  id: index,
-  name: config.name,
-  displayName: config.display,
-  server: config.server,
-  region: config.region,
-  type: config.type,
-  timeout: config.region === '中国' ? 2000 : 3000,
-  status: 'checking',
-  lastCheck: null,
-  responseTime: null
-}));
-
-console.log(`\n🌐 配置 DoH 上游总数: ${upstreams.length}`);
-console.log(`📋 上游列表: ${upstreams.map(u => u.displayName).join(', ')}`);
-
-let selectedUpstreamId = null;
-let availableUpstreams = [...upstreams];
-let currentUpstreamIndex = 0;
-let healthCheckRunning = false;
-
-// ============ 健康检查 ============
-async function checkSingleUpstream(upstream) {
-  const startTime = Date.now();
-  try {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), upstream.timeout + 2000);
-    const url = new URL(upstream.server);
-    url.searchParams.set('name', 'google.com');
-    url.searchParams.set('type', 'A');
-    const response = await fetch(url.toString(), {
-      headers: { 'Accept': 'application/dns-json' },
-      signal: controller.signal
-    });
-    clearTimeout(timeoutId);
-
-    const isOnline = response.ok;
-    upstream.status = isOnline ? 'online' : 'offline';
-    upstream.lastCheck = new Date().toISOString();
-    upstream.responseTime = isOnline ? Date.now() - startTime : null;
-
-    if (isOnline && !availableUpstreams.find(u => u.id === upstream.id)) {
-      availableUpstreams.push(upstream);
-    } else if (!isOnline) {
-      availableUpstreams = availableUpstreams.filter(u => u.id !== upstream.id);
-    }
-
-    if (isOnline) {
-      console.log(`✅ ${upstream.displayName} - ${upstream.responseTime}ms`);
-    } else {
-      console.log(`❌ ${upstream.displayName} - 不可用`);
-    }
-    return isOnline;
-  } catch (err) {
-    upstream.status = 'offline';
-    upstream.lastCheck = new Date().toISOString();
-    upstream.responseTime = null;
-    availableUpstreams = availableUpstreams.filter(u => u.id !== upstream.id);
-    console.log(`❌ ${upstream.displayName} - 不可用 (${err.message})`);
-    return false;
-  }
+get_installed_gost_version() {
+    if [ -f "$GOST_BIN" ] && [ -x "$GOST_BIN" ]; then
+        local ver=$("$GOST_BIN" -V 2>&1 | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+        [ -n "$ver" ] && echo "$ver" || echo "未知版本"
+    else
+        echo "未安装"
+    fi
 }
 
-async function healthCheck() {
-  if (healthCheckRunning) return;
-  healthCheckRunning = true;
-
-  console.log(`\n🔍 开始健康检查 (${new Date().toLocaleTimeString()})`);
-
-  const results = await Promise.all(upstreams.map(u => checkSingleUpstream(u)));
-  const onlineCount = results.filter(r => r === true).length;
-
-  if (availableUpstreams.length === 0) {
-    availableUpstreams = [...upstreams];
-  }
-
-  availableUpstreams.sort((a, b) => (a.responseTime || 9999) - (b.responseTime || 9999));
-
-  console.log(`📡 在线: ${onlineCount}/${upstreams.length}`);
-  if (availableUpstreams[0]) {
-    console.log(`📡 最快: ${availableUpstreams[0].displayName} (${availableUpstreams[0].responseTime}ms)`);
-  }
-
-  healthCheckRunning = false;
+is_v3() {
+    local ver=$(get_installed_gost_version)
+    [[ "$ver" =~ ^[3-9]\. ]] && return 0
+    [[ "$ver" =~ ^v?[3-9]\. ]] && return 0
+    return 1
 }
 
-function getCurrentUpstream() {
-  if (selectedUpstreamId !== null) {
-    const selected = upstreams.find(u => u.id === selectedUpstreamId);
-    if (selected && selected.status === 'online') {
-      return selected;
-    }
-    selectedUpstreamId = null;
-  }
-
-  const onlineSorted = [...availableUpstreams].sort((a, b) => (a.responseTime || 9999) - (b.responseTime || 9999));
-  if (onlineSorted.length > 0) {
-    const upstream = onlineSorted[currentUpstreamIndex % onlineSorted.length];
-    currentUpstreamIndex++;
-    return upstream;
-  }
-
-  return upstreams[0];
+version_ge() {
+    local v1=${1#v}; local v2=${2#v}
+    local IFS=.; local arr1=($v1) arr2=($v2)
+    while [ ${#arr1[@]} -lt 3 ]; do arr1+=(0); done
+    while [ ${#arr2[@]} -lt 3 ]; do arr2+=(0); done
+    for i in 0 1 2; do
+        [ "${arr1[$i]}" -gt "${arr2[$i]}" ] && return 0
+        [ "${arr1[$i]}" -lt "${arr2[$i]}" ] && return 1
+    done
+    return 0
 }
 
-// ============ 核心查询函数 ============
-async function queryDoH(server, domain, type, timeout = 10000) {
-  const url = new URL(server);
-  url.searchParams.set("name", domain);
-  url.searchParams.set("type", type);
-
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), timeout);
-
-  try {
-    const response = await fetch(url.toString(), {
-      headers: { 'Accept': 'application/dns-json' },
-      signal: controller.signal
-    });
-    clearTimeout(timeoutId);
-
-    if (response.ok) {
-      const data = await response.json();
-      return { success: true, data };
-    } else {
-      return { success: false, data: null };
-    }
-  } catch (err) {
-    clearTimeout(timeoutId);
-    throw err;
-  }
+gost_dns_arg() {
+    local dns="$1"
+    [ -z "$dns" ] && return
+    echo "?dns=${dns}"
 }
 
-async function queryDNS(upstream, domain, type) {
-  const result = await queryDoH(upstream.server, domain, type, upstream.timeout);
-  if (result.success && result.data) {
-    return { success: true, data: result.data };
-  }
-  return { success: false, data: null };
+merge_queries() {
+    local base="$1" dns="$2"
+    [ -z "$dns" ] && { echo "$base"; return; }
+    [ -z "$base" ] && { echo "$dns"; return; }
+    echo "${base}&${dns#\?}"
 }
 
-async function queryWithFallback(domain, type, retryCount = 0) {
-  const maxRetries = upstreams.length;
-  const upstream = getCurrentUpstream();
-
-  try {
-    const result = await queryDNS(upstream, domain, type);
-    if (result.success && result.data && (result.data.Answer?.length > 0)) {
-      return { success: true, data: result.data, upstream: upstream.displayName };
-    }
-  } catch (err) {
-    console.log(`${upstream.displayName} 查询失败: ${err.message}`);
-  }
-
-  if (retryCount < maxRetries) {
-    return queryWithFallback(domain, type, retryCount + 1);
-  }
-
-  return { success: false, data: null, upstream: null };
+stop_gost() {
+    if pgrep -f "$GOST_BIN" >/dev/null 2>&1; then
+        echo -e "${YELLOW}正在停止 GOST...${NC}"
+        pkill -f "$GOST_BIN" 2>/dev/null
+        sleep 1
+        pkill -9 -f "$GOST_BIN" 2>/dev/null
+        echo -e "${GREEN}✓ 已停止${NC}"
+    fi
+    [ -f "$GOST_PID_FILE" ] && rm -f "$GOST_PID_FILE"
 }
 
-async function queryAllTypes(domain) {
-  const types = ['A', 'AAAA', 'MX', 'TXT', 'NS', 'CNAME'];
-  const results = {};
-
-  for (const type of types) {
-    const result = await queryWithFallback(domain, type);
-    if (result.success && result.data) {
-      results[type] = result.data.Answer || [];
-      if (!results.upstream) results.upstream = result.upstream;
-    } else {
-      results[type] = [];
-    }
-  }
-
-  return results;
+check_existing_gost() {
+    local ver=$(get_installed_gost_version)
+    if [ "$ver" != "未安装" ]; then
+        echo -e "${GREEN}当前版本: ${ver}${NC}"
+        if pgrep -f "$GOST_BIN" >/dev/null 2>&1; then
+            echo -e "${YELLOW}运行中 PID: $(pgrep -f "$GOST_BIN" | head -1)${NC}"
+        fi
+        echo -n -e "${YELLOW}是否覆盖安装？[y/N]: ${NC}"
+        read ans; flush_input
+        if [[ "$ans" =~ ^[Yy]$ ]]; then
+            pgrep -f "$GOST_BIN" >/dev/null 2>&1 && stop_gost
+            return 0
+        else
+            echo -e "${RED}取消安装。${NC}"
+            return 1
+        fi
+    else
+        echo -e "${GREEN}未检测到 GOST。${NC}"
+        return 0
+    fi
 }
 
-function getCurrentStatus() {
-  return {
-    upstreams: upstreams.map(u => ({
-      id: u.id,
-      name: u.name,
-      displayName: u.displayName,
-      region: u.region,
-      type: u.type,
-      status: u.status,
-      responseTime: u.responseTime,
-      lastCheck: u.lastCheck,
-      selected: selectedUpstreamId === u.id
-    })),
-    mode: selectedUpstreamId === null ? 'auto' : 'manual',
-    selectedId: selectedUpstreamId,
-    currentUpstream: getCurrentUpstream().displayName,
-    availableCount: availableUpstreams.length,
-    totalCount: upstreams.length
-  };
+install_gost_v2() {
+    local version=$1
+    check_existing_gost || return 1
+    mkdir -p "$GOST_DIR"; cd "$GOST_DIR" || return 1
+    rm -f gost gost.tar.gz gost.gz
+    local downloaded=0
+    if version_ge "$version" "2.12"; then
+        local url="https://github.com/ginuerzh/gost/releases/download/v${version}/gost_${version}_${os}_${cpu_arch}.tar.gz"
+        echo -e "      尝试: ${url}"
+        wget -q --timeout=15 -O gost.tar.gz "$url" 2>/dev/null || curl -fsSL --connect-timeout 15 "$url" -o gost.tar.gz 2>/dev/null
+        if [ -f gost.tar.gz ] && [ -s gost.tar.gz ]; then
+            tar -xzf gost.tar.gz gost 2>/dev/null || tar -xzf gost.tar.gz 2>/dev/null
+            [ -f gost ] && downloaded=1
+        fi
+    fi
+    if [ $downloaded -eq 0 ]; then
+        echo -e "${YELLOW}      尝试旧格式 .gz...${NC}"
+        local gz_urls=(
+            "https://github.com/ginuerzh/gost/releases/download/v${version}/gost-${os}-${cpu_arch}-${version}.gz"
+            "https://github.com/ginuerzh/gost/releases/download/v${version}/gost-linux-${cpu_arch}-${version}.gz"
+        )
+        [[ "$os" == "linux" ]] && case "$cpu_arch" in
+            amd64) gz_urls+=("https://github.com/ginuerzh/gost/releases/download/v${version}/gost-linux-amd64-${version}.gz") ;;
+            arm64) gz_urls+=("https://github.com/ginuerzh/gost/releases/download/v${version}/gost-linux-armv8-${version}.gz"
+                            "https://github.com/ginuerzh/gost/releases/download/v${version}/gost-linux-arm64-${version}.gz") ;;
+            armv7) gz_urls+=("https://github.com/ginuerzh/gost/releases/download/v${version}/gost-linux-armv7-${version}.gz") ;;
+            386)   gz_urls+=("https://github.com/ginuerzh/gost/releases/download/v${version}/gost-linux-386-${version}.gz") ;;
+        esac
+        for url in "${gz_urls[@]}"; do
+            echo -e "      尝试: ${url}"
+            if wget -q --timeout=15 -O - "$url" 2>/dev/null | gunzip > gost 2>/dev/null; then
+                [ -f gost ] && [ -s gost ] && { downloaded=1; echo -e "${GREEN}      下载成功${NC}"; break; }
+            fi
+            curl -fsSL --connect-timeout 15 "$url" | gunzip > gost 2>/dev/null
+            [ -f gost ] && [ -s gost ] && { downloaded=1; echo -e "${GREEN}      下载成功${NC}"; break; }
+        done
+    fi
+    if [ $downloaded -eq 0 ]; then
+        echo -e "${RED}下载失败。${NC}"; flush_input; read -n 1 -p "按任意键退出..."; return 1
+    fi
+    chmod +x gost
+    [ -f "$GOST_BIN" ] && [ -x "$GOST_BIN" ] && echo -e "${GREEN}✓ 安装成功${NC}" && "$GOST_BIN" -V 2>&1 | head -1 && return 0
+    echo -e "${RED}安装失败。${NC}"; flush_input; read -n 1 -p "按任意键退出..."; return 1
 }
 
-// ============ 辅助函数 ============
-function formatDNSResponse(data, domain, type) {
-  if (data.Status !== undefined || data.Status === 0) {
-    return data;
-  }
-  const typeNum = recordTypeMap[type] || 1;
-  return {
-    Status: 0,
-    TC: false,
-    RD: true,
-    RA: true,
-    AD: false,
-    CD: false,
-    Question: [{ name: domain, type: typeNum, class: 1 }],
-    Answer: data.Answer || []
-  };
+install_gost_v3() {
+    local version=$1
+    check_existing_gost || return 1
+    mkdir -p "$GOST_DIR"; cd "$GOST_DIR" || return 1
+    rm -f gost gost.tar.gz
+    local clean="${version#v}"
+    local url="https://github.com/go-gost/gost/releases/download/${version}/gost_${clean}_${os}_${cpu_arch}.tar.gz"
+    echo -e "      下载: ${url}"
+    wget -q --timeout=15 -O gost.tar.gz "$url" 2>/dev/null || curl -fsSL --connect-timeout 15 "$url" -o gost.tar.gz 2>/dev/null
+    if [ -f gost.tar.gz ] && [ -s gost.tar.gz ]; then
+        tar -xzf gost.tar.gz gost 2>/dev/null || tar -xzf gost.tar.gz
+        chmod +x gost; rm -f gost.tar.gz
+        [ -f "$GOST_BIN" ] && [ -x "$GOST_BIN" ] && echo -e "${GREEN}✓ 安装成功${NC}" && return 0
+    fi
+    echo -e "${RED}下载失败。${NC}"; flush_input; read -n 1 -p "按任意键退出..."; return 1
 }
 
-function setJsonHeaders(res) {
-  res.set('Content-Type', 'application/json');
-  res.set('Content-Disposition', 'inline');
-  res.set('Cache-Control', 'no-cache, no-store, must-revalidate');
-  res.set('Pragma', 'no-cache');
-  res.set('Expires', '0');
+get_v2_versions() {
+    local versions=$(curl -s --connect-timeout 5 "https://api.github.com/repos/ginuerzh/gost/releases" 2>/dev/null | grep '"tag_name":' | sed -E 's/.*"v?([^"]+)".*/\1/' | head -10)
+    [ -z "$versions" ] && versions="2.12.0 2.11.5 2.11.4 2.11.3 2.11.2 2.11.1 2.11.0 2.10.0 2.9.2"
+    local arr=($versions); local cnt=${#arr[@]}
+    echo -e "${GREEN}可用的 v2 版本:${NC}"
+    for i in "${!arr[@]}"; do echo "  $((i+1))) ${arr[$i]}"; done
+    echo "  $((cnt+1))) 返回"
+    echo -n -e "${YELLOW}请选择 (默认 1): ${NC}"; read choice; flush_input
+    [[ -z "$choice" ]] && choice=1
+    [ "$choice" -eq $((cnt+1)) ] && return 1
+    [ "$choice" -ge 1 ] && [ "$choice" -le "$cnt" ] && install_gost_v2 "${arr[$((choice-1))]}"
 }
 
-// ============ 中间件 ============
-app.use(express.json({ type: 'application/dns-json' }));
-app.use(express.urlencoded({ extended: true }));
-app.use(express.raw({ type: 'application/dns-message', limit: '10mb' }));
-
-app.use((req, res, next) => {
-  res.header('Access-Control-Allow-Origin', '*');
-  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-  res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization');
-  if (req.method === 'OPTIONS') {
-    return res.sendStatus(200);
-  }
-  next();
-});
-
-// ============ 登录验证中间件 ============
-function requireAdmin(req, res, next) {
-  if (req.session && req.session.isAdmin) {
-    next();
-  } else {
-    res.redirect('/admin/login');
-  }
+get_v3_versions() {
+    local all=$(curl -s "https://api.github.com/repos/go-gost/gost/releases" 2>/dev/null | grep '"tag_name":' | sed -E 's/.*"(v[^"]+)".*/\1/')
+    local versions=""
+    [ -z "$all" ] && versions="v3.2.6 v3.2.5 v3.2.4 v3.2.3 v3.2.2 v3.2.1 v3.2.0" || versions=$(echo "$all" | grep -viE 'nightly|rc|alpha|beta' | head -10)
+    local arr=($versions); local cnt=${#arr[@]}
+    [ $cnt -eq 0 ] && arr=(v3.2.6 v3.2.5 v3.2.4 v3.2.3 v3.2.2) && cnt=${#arr[@]}
+    echo -e "${GREEN}可用的 v3 稳定版:${NC}"
+    for i in "${!arr[@]}"; do echo "  $((i+1))) ${arr[$i]}"; done
+    echo "  $((cnt+1))) 返回"
+    echo -n -e "${YELLOW}请选择 (默认 1): ${NC}"; read choice; flush_input
+    [[ -z "$choice" ]] && choice=1
+    [ "$choice" -eq $((cnt+1)) ] && return 1
+    [ "$choice" -ge 1 ] && [ "$choice" -le "$cnt" ] && install_gost_v3 "${arr[$((choice-1))]}"
 }
 
-// ============ 管理员路由 ============
-app.get('/admin/login', (req, res) => {
-  const html = `<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>管理员登录 - DoH Server</title>
-  <style>
-    * { margin: 0; padding: 0; box-sizing: border-box; }
-    body {
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif;
-      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-      min-height: 100vh;
-      display: flex;
-      justify-content: center;
-      align-items: center;
-      padding: 20px;
-    }
-    .login-card {
-      background: white;
-      border-radius: 16px;
-      padding: 40px;
-      width: 100%;
-      max-width: 400px;
-      box-shadow: 0 10px 30px rgba(0,0,0,0.2);
-    }
-    .login-card h1 {
-      color: #667eea;
-      margin-bottom: 30px;
-      text-align: center;
-    }
-    .input-group {
-      margin-bottom: 20px;
-    }
-    .input-group label {
-      display: block;
-      margin-bottom: 8px;
-      color: #555;
-      font-weight: 500;
-    }
-    .input-group input {
-      width: 100%;
-      padding: 12px 15px;
-      border: 2px solid #e0e0e0;
-      border-radius: 8px;
-      font-size: 16px;
-    }
-    .input-group input:focus {
-      outline: none;
-      border-color: #667eea;
-    }
-    button {
-      width: 100%;
-      padding: 12px;
-      background: #667eea;
-      color: white;
-      border: none;
-      border-radius: 8px;
-      font-size: 16px;
-      font-weight: bold;
-      cursor: pointer;
-    }
-    button:hover { background: #5a67d8; }
-    .error {
-      background: #ffebee;
-      color: #f44336;
-      padding: 10px;
-      border-radius: 8px;
-      margin-bottom: 20px;
-      text-align: center;
-    }
-    .footer {
-      text-align: center;
-      margin-top: 20px;
-      color: #999;
-      font-size: 12px;
-    }
-  </style>
-</head>
-<body>
-  <div class="login-card">
-    <h1>🔐 管理员登录</h1>
-    ${req.query.error ? '<div class="error">用户名或密码错误</div>' : ''}
-    <form method="POST" action="/admin/login">
-      <div class="input-group">
-        <label>用户名</label>
-        <input type="text" name="username" required autofocus>
-      </div>
-      <div class="input-group">
-        <label>密码</label>
-        <input type="password" name="password" required>
-      </div>
-      <button type="submit">登 录</button>
-    </form>
-    <div class="footer">DoH Server Admin Panel</div>
-  </div>
-</body>
-</html>`;
-  res.send(html);
-});
-
-app.post('/admin/login', (req, res) => {
-  const { username, password } = req.body;
-  if (username === ADMIN_USER && password === ADMIN_PASS) {
-    req.session.isAdmin = true;
-    res.redirect('/admin');
-  } else {
-    res.redirect('/admin/login?error=1');
-  }
-});
-
-app.get('/admin/logout', (req, res) => {
-  req.session.destroy();
-  res.redirect('/admin/login');
-});
-
-app.get('/admin', requireAdmin, (req, res) => {
-  const hostname = req.headers.host;
-  const protocol = req.headers['x-forwarded-proto'] || 'https';
-  const currentDohUrl = `${protocol}://${hostname}/${DoH路径}`;
-  const homeUrl = `${protocol}://${hostname}/`;
-  const logoutUrl = `${protocol}://${hostname}/admin/logout`;
-
-  const html = `<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>管理员面板 - DoH Server</title>
-  <style>
-    * { margin: 0; padding: 0; box-sizing: border-box; }
-    body {
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif;
-      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-      min-height: 100vh;
-      padding: 20px;
-    }
-    .container { max-width: 1200px; margin: 0 auto; }
-    .header {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      color: white;
-      margin-bottom: 30px;
-      flex-wrap: wrap;
-      gap: 15px;
-    }
-    .header h1 { font-size: 2em; }
-    .header-buttons {
-      display: flex;
-      gap: 12px;
-      align-items: center;
-    }
-    .home-btn {
-      background: rgba(255,255,255,0.2);
-      border: 1px solid rgba(255,255,255,0.3);
-      padding: 8px 16px;
-      border-radius: 8px;
-      color: white;
-      text-decoration: none;
-      transition: all 0.3s ease;
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
-    }
-    .home-btn:hover {
-      background: rgba(255,255,255,0.3);
-      transform: translateY(-2px);
-    }
-    .logout-btn {
-      background: rgba(220, 53, 69, 0.8);
-      border: 1px solid rgba(220, 53, 69, 1);
-      padding: 8px 16px;
-      border-radius: 8px;
-      color: white;
-      text-decoration: none;
-      transition: all 0.3s ease;
-      display: inline-flex;
-      align-items: center;
-      gap: 6px;
-    }
-    .logout-btn:hover {
-      background: rgba(220, 53, 69, 1);
-      transform: translateY(-2px);
-    }
-    .card {
-      background: white;
-      border-radius: 16px;
-      padding: 25px;
-      margin-bottom: 20px;
-      box-shadow: 0 10px 30px rgba(0,0,0,0.2);
-    }
-    .card h2 {
-      color: #667eea;
-      margin-bottom: 20px;
-      border-bottom: 2px solid #e0e0e0;
-      padding-bottom: 10px;
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      flex-wrap: wrap;
-      gap: 10px;
-    }
-    .endpoint {
-      background: #f5f5f5;
-      padding: 12px 15px;
-      border-radius: 8px;
-      font-family: monospace;
-      word-break: break-all;
-    }
-    .upstream-table {
-      width: 100%;
-      border-collapse: collapse;
-    }
-    .upstream-table th, .upstream-table td {
-      padding: 10px;
-      text-align: left;
-      border-bottom: 1px solid #eee;
-    }
-    .upstream-table th {
-      background: #f8f9fa;
-      font-weight: 600;
-    }
-    .status-online { color: #4caf50; font-weight: bold; }
-    .status-offline { color: #f44336; font-weight: bold; }
-    .status-checking { color: #ff9800; }
-    .switch-btn {
-      padding: 4px 12px;
-      border: none;
-      border-radius: 6px;
-      cursor: pointer;
-      font-size: 12px;
-      background: #667eea;
-      color: white;
-    }
-    .switch-btn:hover { background: #5a67d8; }
-    .switch-btn:disabled { background: #ccc; cursor: not-allowed; }
-    .auto-btn {
-      background: #4caf50;
-      padding: 8px 16px;
-      border: none;
-      border-radius: 6px;
-      cursor: pointer;
-      font-size: 14px;
-      color: white;
-    }
-    .auto-btn:hover { background: #45a049; }
-    .refresh-btn {
-      background: #667eea;
-      color: white;
-      border: none;
-      padding: 5px 12px;
-      border-radius: 6px;
-      cursor: pointer;
-      font-size: 12px;
-    }
-    .refresh-btn:hover { background: #5a67d8; }
-    .current-info {
-      background: #e8f4f8;
-      padding: 10px 15px;
-      border-radius: 8px;
-      margin-bottom: 15px;
-    }
-    .footer { text-align: center; color: white; margin-top: 30px; opacity: 0.8; }
-    @media (max-width: 768px) {
-      .upstream-table { font-size: 12px; }
-      .upstream-table th, .upstream-table td { padding: 6px; }
-      .header { flex-direction: column; text-align: center; }
-      .header-buttons { justify-content: center; }
-    }
-  </style>
-</head>
-<body>
-  <div class="container">
-    <div class="header">
-      <h1>🔧 管理员面板</h1>
-      <div class="header-buttons">
-        <a href="${homeUrl}" class="home-btn">
-          🏠 返回前台
-        </a>
-        <a href="${logoutUrl}" class="logout-btn" onclick="return confirm('确定要退出登录吗？')">
-          🚪 退出登录
-        </a>
-      </div>
-    </div>
-
-    <div class="card">
-      <h2>📊 服务状态</h2>
-      <p><strong>🔗 DoH 端点：</strong></p>
-      <div class="endpoint" id="endpoint"></div>
-      <div class="current-info" id="currentInfo"></div>
-    </div>
-
-    <div class="card">
-      <h2>
-        🌐 上游 DNS 服务器
-        <button class="refresh-btn" onclick="refreshHealthCheck()">🔄 刷新健康检查</button>
-      </h2>
-      <div style="overflow-x: auto;">
-        <table class="upstream-table">
-          <thead>
-            <tr><th>状态</th><th>上游服务器</th><th>区域</th><th>响应时间</th><th>操作</th></tr>
-          </thead>
-          <tbody id="upstreamList"></tbody>
-        </table>
-      </div>
-      <div style="margin-top: 15px; text-align: center;">
-        <button class="auto-btn" onclick="setAutoMode()">🔄 切换到自动模式</button>
-      </div>
-    </div>
-
-    <div class="footer">
-      <p>管理员面板 - 只有管理员可以切换上游 DNS</p>
-    </div>
-  </div>
-
-  <script>
-    const endpoint = '${currentDohUrl}';
-    document.getElementById('endpoint').innerHTML = endpoint;
-
-    let currentMode = 'auto';
-    let currentSelectedId = null;
-
-    async function loadUpstreams() {
-      try {
-        const response = await fetch('/api/upstreams');
-        const data = await response.json();
-        currentMode = data.mode;
-        currentSelectedId = data.selectedId;
-        renderUpstreams(data.upstreams, data.mode, data.selectedId);
-        updateCurrentInfo(data.currentUpstream, data.mode);
-      } catch (err) {
-        console.error('加载失败:', err);
-        setTimeout(loadUpstreams, 3000);
-      }
-    }
-
-    function renderUpstreams(upstreams, mode, selectedId) {
-      const tbody = document.getElementById('upstreamList');
-      if (!tbody) return;
-      tbody.innerHTML = '';
-
-      const sorted = [...upstreams].sort((a, b) => {
-        if (a.status === 'online' && b.status !== 'online') return -1;
-        if (a.status !== 'online' && b.status === 'online') return 1;
-        if (a.status === 'online' && b.status === 'online') {
-          return (a.responseTime || 9999) - (b.responseTime || 9999);
-        }
-        return 0;
-      });
-
-      sorted.forEach(u => {
-        const row = tbody.insertRow();
-
-        const statusCell = row.insertCell(0);
-        let statusText = '', statusClass = '';
-        switch(u.status) {
-          case 'online': statusText = '● 在线'; statusClass = 'status-online'; break;
-          case 'offline': statusText = '○ 离线'; statusClass = 'status-offline'; break;
-          default: statusText = '◐ 检测中'; statusClass = 'status-checking';
-        }
-        statusCell.innerHTML = '<span class="' + statusClass + '">' + statusText + '</span>';
-
-        const nameCell = row.insertCell(1);
-        let nameHtml = u.displayName;
-        if (mode === 'manual' && selectedId !== null && u.id === selectedId) {
-          nameHtml += ' <span style="background:#ff9800; color:white; padding:2px 8px; border-radius:4px; font-size:10px;">当前使用</span>';
-        }
-        nameCell.innerHTML = nameHtml;
-
-        const regionCell = row.insertCell(2);
-        regionCell.innerHTML = u.region || '全球';
-
-        const timeCell = row.insertCell(3);
-        timeCell.innerHTML = u.responseTime ? u.responseTime + 'ms' : '-';
-
-        const actionCell = row.insertCell(4);
-        if (u.status === 'online') {
-          const switchBtn = document.createElement('button');
-          if (mode === 'manual' && selectedId !== null && u.id === selectedId) {
-            switchBtn.textContent = '当前使用';
-            switchBtn.disabled = true;
-            switchBtn.style.background = '#ccc';
-            switchBtn.style.cursor = 'default';
-          } else {
-            switchBtn.textContent = '切换到此';
-            switchBtn.className = 'switch-btn';
-            switchBtn.onclick = (function(id) {
-              return function() { switchUpstream(id); };
-            })(u.id);
-          }
-          actionCell.appendChild(switchBtn);
-        } else {
-          actionCell.innerHTML = '<span style="color:#999;">不可用</span>';
-        }
-      });
-    }
-
-    function updateCurrentInfo(upstream, mode) {
-      const infoDiv = document.getElementById('currentInfo');
-      if (!infoDiv) return;
-      const modeText = mode === 'auto' ? '自动切换' : '手动固定';
-      infoDiv.innerHTML = '📡 当前使用: <strong>' + upstream + '</strong> <span style="background:' + (mode === 'auto' ? '#4caf50' : '#ff9800') + '; color:white; padding:2px 8px; border-radius:4px; font-size:12px; margin-left:10px;">' + modeText + '</span>';
-    }
-
-    async function switchUpstream(id) {
-      try {
-        const response = await fetch('/api/switch/' + id, { method: 'POST' });
-        const data = await response.json();
-        if (data.success) {
-          console.log('已切换到:', data.upstream);
-          await loadUpstreams();
-        } else {
-          alert('切换失败: ' + data.message);
-        }
-      } catch (err) {
-        console.error('切换失败:', err);
-        alert('切换失败: ' + err.message);
-      }
-    }
-
-    async function setAutoMode() {
-      try {
-        const response = await fetch('/api/auto', { method: 'POST' });
-        const data = await response.json();
-        if (data.success) {
-          console.log('已切换到自动模式');
-          await loadUpstreams();
-        }
-      } catch (err) {
-        console.error('切换失败:', err);
-      }
-    }
-
-    async function refreshHealthCheck() {
-      const btn = event.target;
-      const originalText = btn.textContent;
-      btn.textContent = '检查中...';
-      btn.disabled = true;
-      try {
-        await fetch('/api/healthcheck', { method: 'POST' });
-        setTimeout(async function() {
-          await loadUpstreams();
-          btn.textContent = originalText;
-          btn.disabled = false;
-        }, 3000);
-      } catch (err) {
-        console.error('刷新失败:', err);
-        btn.textContent = originalText;
-        btn.disabled = false;
-      }
-    }
-
-    loadUpstreams();
-    setInterval(loadUpstreams, 10000);
-  </script>
-</body>
-</html>`;
-  res.send(html);
-});
-
-// ============ API 路由 ============
-app.post('/api/switch/:id', requireAdmin, (req, res) => {
-  const id = parseInt(req.params.id);
-  const upstream = upstreams.find(u => u.id === id);
-
-  if (upstream && upstream.status === 'online') {
-    selectedUpstreamId = id;
-    currentUpstreamIndex = 0;
-    console.log(`🔧 手动切换到: ${upstream.displayName}`);
-    res.json({ success: true, upstream: upstream.displayName });
-  } else {
-    res.json({ success: false, message: '上游不可用' });
-  }
-});
-
-app.post('/api/auto', requireAdmin, (req, res) => {
-  selectedUpstreamId = null;
-  currentUpstreamIndex = 0;
-  console.log(`🔧 切换到自动模式`);
-  res.json({ success: true, mode: 'auto' });
-});
-
-app.post('/api/healthcheck', requireAdmin, async (req, res) => {
-  await healthCheck();
-  res.json({ success: true });
-});
-
-app.get('/api/upstreams', (req, res) => {
-  res.json(getCurrentStatus());
-});
-
-app.get('/api/dns', async (req, res) => {
-  const domain = req.query.domain || 'www.google.com';
-  const type = req.query.type || 'A';
-
-  try {
-    if (type === 'all') {
-      const results = await queryAllTypes(domain);
-      const formatted = {
-        Status: 0,
-        upstream: results.upstream || 'auto',
-        ...results
-      };
-      setJsonHeaders(res);
-      return res.json(formatted);
-    } else {
-      const result = await queryWithFallback(domain, type);
-      if (result.success) {
-        const formatted = formatDNSResponse(result.data, domain, type);
-        setJsonHeaders(res);
-        return res.json({
-          Status: formatted.Status,
-          upstream: result.upstream,
-          ...formatted
-        });
-      } else {
-        setJsonHeaders(res);
-        return res.status(404).json({
-          Status: 2,
-          upstream: null,
-          Answer: [],
-          error: '查询失败'
-        });
-      }
-    }
-  } catch (err) {
-    setJsonHeaders(res);
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// ============ DoH 端点 ============
-app.all(`/${DoH路径}`, async (req, res) => {
-  const { method, headers, body } = req;
-  const UA = headers['user-agent'] || 'DoH Client';
-  const accept = headers['accept'] || '';
-  const contentType = headers['content-type'] || '';
-
-  try {
-    const upstream = getCurrentUpstream();
-    let domain = null;
-    let type = 'A';
-    let response = null;
-
-    async function tryMultipleDoHEndpoints(endpoints, requestUrl, options) {
-      let lastError = null;
-      for (const endpoint of endpoints) {
-        try {
-          const fullUrl = requestUrl ? `${endpoint}${requestUrl}` : endpoint;
-          const resp = await fetch(fullUrl, options);
-          if (resp.ok) return resp;
-          lastError = new Error(`HTTP ${resp.status}`);
-        } catch (err) {
-          lastError = err;
-        }
-      }
-      throw lastError || new Error('所有 DoH 端点均失败');
-    }
-
-    if (method === 'GET') {
-      const url = new URL(req.url, `http://${req.headers.host}`);
-
-      if (url.searchParams.has('name')) {
-        domain = url.searchParams.get('name');
-        type = url.searchParams.get('type') || 'A';
-
-        if (accept.includes('application/dns-message')) {
-          const endpoints = upstreams.filter(u => u.status === 'online').map(u => u.server);
-          if (endpoints.length === 0) endpoints.push(upstream.server);
-          const queryString = `?name=${encodeURIComponent(domain)}&type=${encodeURIComponent(type)}`;
-          const wireResponse = await tryMultipleDoHEndpoints(
-            endpoints,
-            queryString,
-            { headers: { 'Accept': 'application/dns-message', 'User-Agent': UA } }
-          );
-          const arrayBuffer = await wireResponse.arrayBuffer();
-          const wireBody = Buffer.from(arrayBuffer);
-          res.set('Content-Type', 'application/dns-message');
-          res.set('Content-Length', wireBody.length);
-          res.set('Access-Control-Allow-Origin', '*');
-          return res.status(wireResponse.status).send(wireBody);
-        }
-
-        const result = await queryDNS(upstream, domain, type);
-        if (result.success && result.data) {
-          const formatted = formatDNSResponse(result.data, domain, type);
-          setJsonHeaders(res);
-          return res.json(formatted);
-        } else {
-          setJsonHeaders(res);
-          return res.status(500).json({
-            Status: 2,
-            Answer: [],
-            error: 'DNS 查询失败',
-            code: 'QUERY_FAILED'
-          });
-        }
-      }
-
-      if (url.searchParams.has('dns')) {
-        const endpoints = upstreams.filter(u => u.status === 'online').map(u => u.server);
-        if (endpoints.length === 0) endpoints.push(upstream.server);
-        const base64url = url.searchParams.get('dns');
-        const queryString = `?dns=${encodeURIComponent(base64url)}`;
-        const wireResponse = await tryMultipleDoHEndpoints(
-          endpoints,
-          queryString,
-          { headers: { 'Accept': 'application/dns-message', 'User-Agent': UA } }
-        );
-        const arrayBuffer = await wireResponse.arrayBuffer();
-        const wireBody = Buffer.from(arrayBuffer);
-        res.set('Content-Type', 'application/dns-message');
-        res.set('Content-Length', wireBody.length);
-        res.set('Access-Control-Allow-Origin', '*');
-        return res.status(wireResponse.status).send(wireBody);
-      }
-
-      setJsonHeaders(res);
-      return res.status(400).json({ error: '缺少参数 name 或 dns' });
-    }
-
-    else if (method === 'POST') {
-      let rawBody = '';
-      if (Buffer.isBuffer(body)) {
-        rawBody = body.toString('utf8');
-      } else if (typeof body === 'string') {
-        rawBody = body;
-      } else if (body && typeof body === 'object') {
-        rawBody = JSON.stringify(body);
-      }
-
-      if (contentType.includes('application/dns-json')) {
-        try {
-          let jsonBody;
-          if (typeof body === 'object' && body !== null && !Buffer.isBuffer(body)) {
-            jsonBody = body;
-          } else {
-            jsonBody = JSON.parse(rawBody);
-          }
-          domain = jsonBody.name || jsonBody.domain;
-          type = jsonBody.type || 'A';
-        } catch (e) {
-          setJsonHeaders(res);
-          return res.status(400).json({ error: '无效的 JSON 格式', message: e.message });
-        }
-      } else if (contentType.includes('application/x-www-form-urlencoded')) {
-        try {
-          if (req.body && typeof req.body === 'object' && Object.keys(req.body).length > 0) {
-            domain = req.body.name || req.body.domain;
-            type = req.body.type || 'A';
-          } else if (rawBody) {
-            const params = new URLSearchParams(rawBody);
-            domain = params.get('name') || params.get('domain');
-            type = params.get('type') || 'A';
-          }
-        } catch (e) {
-          setJsonHeaders(res);
-          return res.status(400).json({ error: '无效的表单格式' });
-        }
-      } else if (contentType.includes('application/dns-message')) {
-        const endpoints = upstreams.filter(u => u.status === 'online').map(u => u.server);
-        if (endpoints.length === 0) endpoints.push(upstream.server);
-        const options = {
-          method: 'POST',
-          headers: {
-            'Accept': 'application/dns-message',
-            'Content-Type': 'application/dns-message',
-            'User-Agent': UA
-          },
-          body: body
-        };
-        let lastError = null;
-        for (const endpoint of endpoints) {
-          try {
-            const resp = await fetch(endpoint, options);
-            if (resp.ok) {
-              response = resp;
-              break;
-            }
-            lastError = new Error(`HTTP ${resp.status}`);
-          } catch (err) {
-            lastError = err;
-          }
-        }
-        if (!response) {
-          throw lastError || new Error('所有 DoH POST 失败');
-        }
-      } else if (rawBody.trim().startsWith('{')) {
-        try {
-          const jsonBody = JSON.parse(rawBody);
-          domain = jsonBody.name || jsonBody.domain;
-          type = jsonBody.type || 'A';
-        } catch (e) {
-          setJsonHeaders(res);
-          return res.status(400).json({ error: '无法解析 JSON 请求体' });
-        }
-      } else if (rawBody.includes('=')) {
-        try {
-          const params = new URLSearchParams(rawBody);
-          domain = params.get('name') || params.get('domain');
-          type = params.get('type') || 'A';
-        } catch (e) {
-          setJsonHeaders(res);
-          return res.status(400).json({ error: '无法解析表单请求体' });
-        }
-      }
-
-      if (domain && !response) {
-        if (accept.includes('application/dns-message')) {
-          const endpoints = upstreams.filter(u => u.status === 'online').map(u => u.server);
-          if (endpoints.length === 0) endpoints.push(upstream.server);
-          const queryString = `?name=${encodeURIComponent(domain)}&type=${encodeURIComponent(type)}`;
-          const wireResponse = await tryMultipleDoHEndpoints(
-            endpoints,
-            queryString,
-            { headers: { 'Accept': 'application/dns-message', 'User-Agent': UA } }
-          );
-          const arrayBuffer = await wireResponse.arrayBuffer();
-          const wireBody = Buffer.from(arrayBuffer);
-          res.set('Content-Type', 'application/dns-message');
-          res.set('Content-Length', wireBody.length);
-          res.set('Access-Control-Allow-Origin', '*');
-          return res.status(wireResponse.status).send(wireBody);
-        }
-
-        const result = await queryDNS(upstream, domain, type);
-        if (result.success && result.data) {
-          const formatted = formatDNSResponse(result.data, domain, type);
-          setJsonHeaders(res);
-          return res.json(formatted);
-        } else {
-          setJsonHeaders(res);
-          return res.status(500).json({
-            Status: 2,
-            Answer: [],
-            error: 'DNS 查询失败',
-            code: 'QUERY_FAILED'
-          });
-        }
-      }
-
-      if (!domain && !response) {
-        setJsonHeaders(res);
-        return res.status(400).json({
-          error: '无法解析请求',
-          message: '请确保请求包含 name 或 domain 参数',
-          contentType: contentType
-        });
-      }
-    }
-
-    if (response) {
-      if (!response.ok) throw new Error(`DoH 返回错误 (${response.status})`);
-      const arrayBuffer = await response.arrayBuffer();
-      const responseBody = Buffer.from(arrayBuffer);
-      res.set('Content-Type', 'application/dns-message');
-      res.set('Content-Length', responseBody.length);
-      res.set('Access-Control-Allow-Origin', '*');
-      return res.status(response.status).send(responseBody);
-    }
-
-    setJsonHeaders(res);
-    return res.status(400).json({ error: '不支持的请求格式' });
-
-  } catch (error) {
-    console.error("DoH 请求处理错误:", error);
-    setJsonHeaders(res);
-    res.status(500).json({ error: '内部服务器错误', message: error.message, code: 'INTERNAL_ERROR' });
-  }
-});
-
-// ============ 公开首页 ============
-app.get('/', (req, res) => {
-  const hostname = req.headers.host;
-  const protocol = req.headers['x-forwarded-proto'] || 'https';
-  const currentDohUrl = `${protocol}://${hostname}/${DoH路径}`;
-  const adminUrl = `${protocol}://${hostname}/admin`;
-
-  const html = `<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>DNS-over-HTTPS Server</title>
-  <style>
-    * { margin: 0; padding: 0; box-sizing: border-box; }
-    body {
-      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif;
-      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-      min-height: 100vh;
-      padding: 20px;
-    }
-    .container { max-width: 1000px; margin: 0 auto; }
-    .header {
-      display: flex;
-      justify-content: space-between;
-      align-items: center;
-      color: white;
-      margin-bottom: 30px;
-      flex-wrap: wrap;
-      gap: 15px;
-    }
-    .header h1 { font-size: 2.5em; }
-    .header-sub { text-align: right; }
-    .login-btn {
-      background: rgba(255,255,255,0.2);
-      border: 1px solid rgba(255,255,255,0.3);
-      padding: 10px 24px;
-      border-radius: 30px;
-      color: white;
-      text-decoration: none;
-      font-size: 14px;
-      font-weight: 500;
-      transition: all 0.3s ease;
-      display: inline-flex;
-      align-items: center;
-      gap: 8px;
-    }
-    .login-btn:hover {
-      background: rgba(255,255,255,0.3);
-      transform: translateY(-2px);
-    }
-    .header-description {
-      text-align: center;
-      color: white;
-      margin-top: -15px;
-      margin-bottom: 30px;
-      opacity: 0.9;
-    }
-    .card {
-      background: white;
-      border-radius: 16px;
-      padding: 25px;
-      margin-bottom: 20px;
-      box-shadow: 0 10px 30px rgba(0,0,0,0.2);
-    }
-    .card h2 {
-      color: #667eea;
-      margin-bottom: 20px;
-      border-bottom: 2px solid #e0e0e0;
-      padding-bottom: 10px;
-    }
-    .endpoint {
-      background: #f5f5f5;
-      padding: 12px 15px;
-      border-radius: 8px;
-      font-family: monospace;
-      word-break: break-all;
-    }
-    .upstream-table {
-      width: 100%;
-      border-collapse: collapse;
-    }
-    .upstream-table th, .upstream-table td {
-      padding: 10px;
-      text-align: left;
-      border-bottom: 1px solid #eee;
-    }
-    .upstream-table th {
-      background: #f8f9fa;
-      font-weight: 600;
-    }
-    .status-online { color: #4caf50; font-weight: bold; }
-    .status-offline { color: #f44336; font-weight: bold; }
-    .status-checking { color: #ff9800; }
-    .query-box {
-      display: flex;
-      gap: 10px;
-      flex-wrap: wrap;
-      margin-bottom: 20px;
-    }
-    .query-box input {
-      flex: 2;
-      padding: 12px 15px;
-      border: 2px solid #e0e0e0;
-      border-radius: 8px;
-      font-size: 16px;
-    }
-    .query-box input:focus {
-      outline: none;
-      border-color: #667eea;
-    }
-    .query-box select, .query-box button {
-      padding: 12px 15px;
-      border-radius: 8px;
-      font-size: 16px;
-    }
-    .query-box select {
-      border: 2px solid #e0e0e0;
-      background: white;
-      cursor: pointer;
-    }
-    .query-box button {
-      background: #667eea;
-      color: white;
-      border: none;
-      cursor: pointer;
-      transition: background 0.3s;
-    }
-    .query-box button:hover { background: #5a67d8; }
-    .result {
-      background: #f7f7f7;
-      padding: 20px;
-      border-radius: 10px;
-      font-family: monospace;
-      font-size: 13px;
-      margin-top: 20px;
-      display: none;
-      overflow-x: auto;
-      border-left: 4px solid #667eea;
-    }
-    .result.show { display: block; }
-    .result.error { border-left-color: #f44336; background: #ffebee; }
-    .loading {
-      display: inline-block;
-      width: 20px;
-      height: 20px;
-      border: 2px solid #f3f3f3;
-      border-top: 2px solid #667eea;
-      border-radius: 50%;
-      animation: spin 1s linear infinite;
-      margin-right: 10px;
-      vertical-align: middle;
-    }
-    @keyframes spin {
-      0% { transform: rotate(0deg); }
-      100% { transform: rotate(360deg); }
-    }
-    .footer { text-align: center; color: white; margin-top: 30px; opacity: 0.8; }
-    .record-card {
-      background: #f8f9fa;
-      border-radius: 8px;
-      padding: 15px;
-      margin-bottom: 15px;
-    }
-    .record-title {
-      font-weight: bold;
-      color: #667eea;
-      margin-bottom: 10px;
-      border-left: 3px solid #667eea;
-      padding-left: 10px;
-    }
-    .record-item {
-      padding: 5px 0;
-      border-bottom: 1px solid #e0e0e0;
-      font-family: monospace;
-    }
-    .current-info {
-      background: #e8f4f8;
-      padding: 10px 15px;
-      border-radius: 8px;
-      margin-top: 15px;
-    }
-    .curl-example {
-      background: #1e1e1e;
-      color: #d4d4d4;
-      padding: 15px;
-      border-radius: 8px;
-      font-family: monospace;
-      font-size: 13px;
-      overflow-x: auto;
-      white-space: pre-wrap;
-      word-break: break-all;
-      margin: 8px 0;
-    }
-    .curl-example a {
-      color: #66d9ef;
-    }
-    .tag {
-      display: inline-block;
-      background: #667eea;
-      color: white;
-      font-size: 12px;
-      padding: 2px 10px;
-      border-radius: 12px;
-      margin-right: 6px;
-    }
-    @media (max-width: 768px) {
-      .upstream-table { font-size: 12px; }
-      .upstream-table th, .upstream-table td { padding: 6px; }
-      .header { flex-direction: column; text-align: center; }
-      .header h1 { font-size: 1.8em; }
-      .header-sub { text-align: center; }
-    }
-  </style>
-</head>
-<body>
-  <div class="container">
-    <div class="header">
-      <h1>🖥️ DNS over HTTPS Server</h1>
-      <div class="header-sub">
-        <a href="${adminUrl}" class="login-btn">
-          🔐 管理员登录
-        </a>
-      </div>
-    </div>
-    <div class="header-description">
-      <p>纯 DoH 服务 | 多记录类型 | 支持 GET/POST & Wire Format</p>
-    </div>
-
-    <div class="card">
-      <h2>📊 服务状态</h2>
-      <p><strong>🔗 DoH 端点：</strong></p>
-      <div class="endpoint" id="endpoint"></div>
-      <div class="current-info" id="currentInfo"></div>
-    </div>
-
-    <div class="card">
-      <h2>🌐 上游 DNS 服务器</h2>
-      <div style="overflow-x: auto;">
-        <table class="upstream-table">
-          <thead>
-            <tr><th>状态</th><th>上游服务器</th><th>区域</th><th>响应时间</th></tr>
-          </thead>
-          <tbody id="upstreamList"></tbody>
-        </table>
-      </div>
-    </div>
-
-    <div class="card">
-      <h2>🔧 DNS 查询工具</h2>
-      <div class="query-box">
-        <input type="text" id="domain" placeholder="域名，如: google.com" value="google.com">
-        <select id="recordType">
-          <option value="A">A (IPv4 地址)</option>
-          <option value="AAAA">AAAA (IPv6 地址)</option>
-          <option value="CNAME">CNAME (规范名称)</option>
-          <option value="MX">MX (邮件交换)</option>
-          <option value="TXT">TXT (文本记录)</option>
-          <option value="NS">NS (域名服务器)</option>
-          <option value="HTTPS">HTTPS (ECH配置)</option>
-          <option value="all" selected>全部 (A/AAAA/MX/TXT/NS/CNAME)</option>
-        </select>
-        <button onclick="queryDNS()" id="queryBtn">🚀 查询</button>
-      </div>
-      <div id="result" class="result"></div>
-    </div>
-
-    <!-- ========== 完整的“使用示例”卡片（简洁风格） ========== -->
-    <div class="card">
-      <h2>📖 使用示例</h2>
-      <div style="font-size:14px; margin-bottom:12px; color:#555;">
-        以下命令中的端点 <code>${currentDohUrl}</code> 已自动替换为您的实际地址，可直接复制运行。
-      </div>
-
-      <!-- 1. GET JSON -->
-      <div style="margin-bottom:16px; border-left:3px solid #667eea; padding-left:12px;">
-        <div style="font-weight:bold; color:#667eea;">1️⃣ GET 请求 – JSON 格式（?name=）</div>
-        <div class="curl-example"># A 记录 (IPv4)
-curl -H "accept: application/dns-json" \\
-  "${currentDohUrl}?name=google.com&type=A"
-
-# AAAA 记录 (IPv6)
-curl -H "accept: application/dns-json" \\
-  "${currentDohUrl}?name=google.com&type=AAAA"
-
-# HTTPS 记录 (ECH 配置)
-curl -H "accept: application/dns-json" \\
-  "${currentDohUrl}?name=cloudflare-ech.com&type=HTTPS"</div>
-        <div style="font-size:13px; color:#666;">预期：返回 JSON，Answer 中包含对应记录。</div>
-      </div>
-
-      <!-- 2. GET Wire Format -->
-      <div style="margin-bottom:16px; border-left:3px solid #667eea; padding-left:12px;">
-        <div style="font-weight:bold; color:#667eea;">2️⃣ GET 请求 – Wire Format（?dns=）</div>
-        <div class="curl-example"># 查询 google.com A 记录（Base64URL 编码示例）
-curl -H "accept: application/dns-message" \\
-  "${currentDohUrl}?dns=AAABAAABAAAAAAAAB2V4YW1wbGUDY29tAAABAAE"</div>
-        <div style="font-size:13px; color:#666;">
-          预期：返回二进制 DNS 数据（终端会显示乱码，这是正常的）。<br>
-          验证响应头：<code>content-type: application/dns-message</code>
-        </div>
-      </div>
-
-      <!-- 3. POST JSON -->
-      <div style="margin-bottom:16px; border-left:3px solid #667eea; padding-left:12px;">
-        <div style="font-weight:bold; color:#667eea;">3️⃣ POST 请求 – JSON Body</div>
-        <div class="curl-example"># A 记录查询
-curl -X POST -H "Content-Type: application/dns-json" \\
-  -d '{"name":"google.com","type":"A"}' \\
-  "${currentDohUrl}"
-
-# HTTPS 记录查询
-curl -X POST -H "Content-Type: application/dns-json" \\
-  -d '{"name":"cloudflare-ech.com","type":"HTTPS"}' \\
-  "${currentDohUrl}"</div>
-        <div style="font-size:13px; color:#666;">预期：返回 JSON，Answer 中包含记录。</div>
-      </div>
-
-      <!-- 4. POST 表单 -->
-      <div style="margin-bottom:16px; border-left:3px solid #667eea; padding-left:12px;">
-        <div style="font-weight:bold; color:#667eea;">4️⃣ POST 请求 – 表单格式</div>
-        <div class="curl-example">curl -X POST -H "Content-Type: application/x-www-form-urlencoded" \\
-  -d "name=google.com&type=A" \\
-  "${currentDohUrl}"</div>
-        <div style="font-size:13px; color:#666;">预期：返回 JSON，Answer 中包含 IPv4 地址。</div>
-      </div>
-
-      <!-- 5. POST Wire Format -->
-      <div style="margin-bottom:16px; border-left:3px solid #667eea; padding-left:12px;">
-        <div style="font-weight:bold; color:#667eea;">5️⃣ POST 请求 – Wire Format（原始二进制）
-# 发送二进制数据
-echo -n "AAABAAABAAAAAAAAB2V4YW1wbGUDY29tAAABAAE" | base64 -d > query.bin
-curl -X POST -H "Content-Type: application/dns-message" --data-binary @query.bin \\
-  "${currentDohUrl}"</div>
-        <div style="font-size:13px; color:#666;">
-          预期：返回二进制 DNS 响应（终端显示乱码）。<br>
-          验证响应头：<code>content-type: application/dns-message</code>
-        </div>
-      </div>
-
-      <!-- 浏览器配置 -->
-      <div style="border-top:1px solid #e0e0e0; padding-top:12px; margin-top:8px;">
-        <div style="font-weight:bold; color:#667eea;">🌐 浏览器访问 & 配置 DoH</div>
-        <div class="curl-example" style="background:#f0f0f0; color:#333;">
-          # 浏览器直接访问（显示 JSON）
-          <a href="${currentDohUrl}?name=google.com&type=A" target="_blank">${currentDohUrl}?name=google.com&type=A</a>
-
-          # Chrome/Edge 配置 DoH
-          设置 → 隐私和安全 → 安全 → 使用安全 DNS → 自定义
-          填入：<strong>${currentDohUrl}</strong>
-        </div>
-      </div>
-
-      <!-- 诊断命令 -->
-      <div style="margin-top:12px; border-top:1px solid #e0e0e0; padding-top:12px;">
-        <div style="font-weight:bold; color:#667eea;">🔍 诊断辅助命令</div>
-        <div class="curl-example" style="background:#f0f0f0; color:#333;">
-# 查看完整响应头（确认 Content-Type）
-curl -I "${currentDohUrl}?name=google.com&type=A"
-
-# 查看 wire format 响应头
-curl -I -H "accept: application/dns-message" \\
-  "${currentDohUrl}?dns=AAABAAABAAAAAAAAB2V4YW1wbGUDY29tAAABAAE"
-
-# 保存 wire format 响应到文件（避免终端乱码）
-curl -H "accept: application/dns-message" \\
-  "${currentDohUrl}?dns=AAABAAABAAAAAAAAB2V4YW1wbGUDY29tAAABAAE" \\
-  --output response.bin
-</div>
-      </div>
-    </div>
-
-    <div class="footer">
-      <p>🚀 Node.js DoH Server | 公开服务 - 管理员可切换上游</p>
-    </div>
-  </div>
-
-  <script>
-    const endpoint = '${currentDohUrl}';
-    document.getElementById('endpoint').innerHTML = endpoint;
-
-    async function loadUpstreams() {
-      try {
-        const response = await fetch('/api/upstreams');
-        const data = await response.json();
-        renderUpstreams(data.upstreams, data.mode, data.selectedId);
-        updateCurrentInfo(data.currentUpstream, data.mode);
-      } catch (err) {
-        console.error('加载失败:', err);
-        setTimeout(loadUpstreams, 3000);
-      }
-    }
-
-    function renderUpstreams(upstreams, mode, selectedId) {
-      const tbody = document.getElementById('upstreamList');
-      if (!tbody) return;
-      tbody.innerHTML = '';
-
-      const sorted = [...upstreams].sort((a, b) => {
-        if (a.status === 'online' && b.status !== 'online') return -1;
-        if (a.status !== 'online' && b.status === 'online') return 1;
-        if (a.status === 'online' && b.status === 'online') {
-          return (a.responseTime || 9999) - (b.responseTime || 9999);
-        }
-        return 0;
-      });
-
-      sorted.forEach(u => {
-        const row = tbody.insertRow();
-
-        const statusCell = row.insertCell(0);
-        let statusText = '', statusClass = '';
-        switch(u.status) {
-          case 'online': statusText = '● 在线'; statusClass = 'status-online'; break;
-          case 'offline': statusText = '○ 离线'; statusClass = 'status-offline'; break;
-          default: statusText = '◐ 检测中'; statusClass = 'status-checking';
-        }
-        statusCell.innerHTML = '<span class="' + statusClass + '">' + statusText + '</span>';
-
-        const nameCell = row.insertCell(1);
-        let nameHtml = u.displayName;
-        if (mode === 'manual' && selectedId !== null && u.id === selectedId) {
-          nameHtml += ' <span style="background:#ff9800; color:white; padding:2px 8px; border-radius:4px; font-size:10px;">当前</span>';
-        }
-        nameCell.innerHTML = nameHtml;
-
-        const regionCell = row.insertCell(2);
-        regionCell.innerHTML = u.region || '全球';
-
-        const timeCell = row.insertCell(3);
-        timeCell.innerHTML = u.responseTime ? u.responseTime + 'ms' : '-';
-      });
-    }
-
-    function updateCurrentInfo(upstream, mode) {
-      const infoDiv = document.getElementById('currentInfo');
-      if (!infoDiv) return;
-      const modeText = mode === 'auto' ? '自动切换模式' : '手动固定模式';
-      infoDiv.innerHTML = '📡 当前使用: <strong>' + upstream + '</strong> | ' + modeText;
-    }
-
-    function formatMXRecord(r) {
-      if (r.priority !== undefined) {
-        return '<span style="color:#666; font-size:11px;">[' + r.priority + ']</span> ' + r.exchange;
-      }
-      return r.data || String(r);
-    }
-
-    function displayResults(data, domain, type) {
-      let html = '<strong>✅ ' + domain + ' 查询结果</strong><br>';
-      if (data.upstream) html += '<small>📡 上游: ' + data.upstream + '</small><br><br>';
-
-      if (type === 'all') {
-        const types = ['A', 'AAAA', 'CNAME', 'MX', 'TXT', 'NS'];
-        for (let i = 0; i < types.length; i++) {
-          const t = types[i];
-          const records = data[t] || [];
-          html += '<div class="record-card">';
-          html += '<div class="record-title">📋 ' + t + ' 记录</div>';
-          if (records.length > 0) {
-            for (let j = 0; j < records.length; j++) {
-              const r = records[j];
-              if (t === 'MX') {
-                html += '<div class="record-item">' + formatMXRecord(r) + '</div>';
-              } else {
-                html += '<div class="record-item">' + (r.data || r.exchange || JSON.stringify(r)) + '</div>';
-              }
-            }
-          } else {
-            html += '<div class="record-item" style="color:#999;">无记录</div>';
-          }
-          html += '</div>';
-        }
-      } else {
-        const records = data.Answer || [];
-        html += '<div class="record-card">';
-        html += '<div class="record-title">📋 ' + type + ' 记录</div>';
-        if (records.length > 0) {
-          for (let i = 0; i < records.length; i++) {
-            const r = records[i];
-            if (type === 'MX') {
-              html += '<div class="record-item">' + formatMXRecord(r) + '</div>';
-            } else {
-              html += '<div class="record-item">' + (r.data || JSON.stringify(r)) + '</div>';
-            }
-          }
-        } else {
-          html += '<div class="record-item" style="color:#999;">无记录</div>';
-        }
-        html += '</div>';
-      }
-
-      return html;
-    }
-
-    async function queryDNS() {
-      const domain = document.getElementById('domain').value.trim();
-      const recordType = document.getElementById('recordType').value;
-      if (!domain) { alert('请输入域名'); return; }
-
-      const resultDiv = document.getElementById('result');
-      const queryBtn = document.getElementById('queryBtn');
-      resultDiv.innerHTML = '<span class="loading"></span> 正在查询...';
-      resultDiv.classList.add('show');
-      queryBtn.disabled = true;
-
-      try {
-        const url = '/api/dns?domain=' + encodeURIComponent(domain) + '&type=' + recordType;
-        const response = await fetch(url);
-        if (!response.ok) throw new Error('HTTP ' + response.status);
-        const data = await response.json();
-
-        resultDiv.innerHTML = displayResults(data, domain, recordType);
-        resultDiv.classList.remove('error');
-      } catch (err) {
-        resultDiv.innerHTML = '❌ 查询失败: ' + err.message;
-        resultDiv.classList.add('error');
-      } finally {
-        queryBtn.disabled = false;
-      }
-    }
-
-    document.getElementById('domain').addEventListener('keypress', function(e) {
-      if (e.key === 'Enter') queryDNS();
-    });
-
-    loadUpstreams();
-    setInterval(loadUpstreams, 10000);
-  </script>
-</body>
-</html>`;
-  res.send(html);
-});
-
-// ============ 健康检查端点 ============
-app.get('/health', (req, res) => {
-  const status = getCurrentStatus();
-  setJsonHeaders(res);
-  res.json({
-    status: 'ok',
-    timestamp: new Date().toISOString(),
-    dohPath: `/${DoH路径}`,
-    mode: status.mode,
-    currentUpstream: status.currentUpstream,
-    available: status.availableCount,
-    total: status.totalCount,
-    protocols: ['DoH']
-  });
-});
-
-// 启动服务器
-app.listen(PORT, '0.0.0.0', async () => {
-  console.log(`========================================`);
-  console.log(`🛡️ 纯 DoH 服务器已启动`);
-  console.log(`📡 端口: ${PORT}`);
-  console.log(`🔗 DoH 端点: /${DoH路径}`);
-  console.log(`🔐 管理员入口: /admin`);
-  console.log(`📋 默认账号: ${ADMIN_USER} / ${ADMIN_PASS}`);
-  console.log(`🌐 DoH 上游总数: ${upstreams.length}`);
-  console.log(`========================================`);
-
-  await healthCheck();
-  setInterval(healthCheck, 60000);
-});
-
-process.on('SIGTERM', () => {
-  console.log('正在关闭...');
-  process.exit(0);
-});
+select_version_to_install() {
+    echo -e "${BLUE}========================================${NC}"
+    echo -e "        选择 GOST 版本"
+    echo -e "${BLUE}========================================${NC}"
+    echo -e "  1) GOST v2"
+    echo -e "  2) GOST v3"
+    echo -e "  0) 返回"
+    echo -n -e "${YELLOW}请选择 [0-2]: ${NC}"; read choice; flush_input
+    case $choice in
+        1) get_v2_versions ;;
+        2) get_v3_versions ;;
+        0) return 1 ;;
+        *) echo -e "${RED}无效${NC}"; return 1 ;;
+    esac
+}
+
+save_node_info() {
+    printf "%s\n" "$1" > "$SUBFILE"
+    echo -e "${GREEN}节点信息已保存到: ${SUBFILE}${NC}"
+}
+
+start_gost_generic() {
+    local cmd="$1" info="$2"
+    cd "$GOST_DIR" || return 1
+    stop_gost
+    echo -e "${GREEN}启动代理...${NC}"
+    echo "$cmd" > "$GOST_CMD_FILE"
+    echo "=== GOST 启动于 $(date) ===" > "$GOST_LOG"
+    echo "命令: $cmd" >> "$GOST_LOG"
+    echo "信息: $info" >> "$GOST_LOG"
+    nohup $cmd >> "$GOST_LOG" 2>&1 &
+    local pid=$!
+    echo $pid > "$GOST_PID_FILE"
+    sleep 2
+    if pgrep -f "$GOST_BIN" >/dev/null 2>&1; then
+        echo -e "${GREEN}✓ 运行中 (PID: $pid)${NC}"
+        echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+        echo -e "${GREEN}代理信息:${NC}\n${YELLOW}${info}${NC}"
+        echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+        save_node_info "$info"
+        echo "进程 PID: $pid, 启动成功" >> "$GOST_LOG"
+        return 0
+    else
+        echo -e "${RED}启动失败，最后几行日志:${NC}"
+        tail -5 "$GOST_LOG"
+        echo -e "${RED}查看完整日志: ${GOST_LOG}${NC}"
+        return 1
+    fi
+}
+
+build_query_string() {
+    local q=""; local sep=""
+    for p in "$@"; do
+        [ -n "$p" ] && q="${q}${sep}${p}" && sep="&"
+    done
+    [ -n "$q" ] && echo "?${q}"
+}
+
+ensure_leading_slash() {
+    local p="$1"
+    [ -z "$p" ] && return
+    [[ "$p" != /* ]] && echo "/$p" || echo "$p"
+}
+
+# ---------- DNS 代理配置 ----------
+configure_dns() {
+    echo -e "${YELLOW}DNS 代理模式:${NC}"
+    echo -e " 1) 直接 DoH (本地加密查询公共 DNS)"
+    echo -e " 2) 转发至远程服务器 (通过隧道交给远程解析)"
+    echo -n -e "${YELLOW}请选择 [1-2] (默认 1): ${NC}"
+    read dns_mode; flush_input
+    [[ -z "$dns_mode" ]] && dns_mode=1
+
+    local bind_ip=""
+    echo -n -e "${YELLOW}监听地址 (默认 127.0.0.1，留空监听所有接口): ${NC}"
+    read bind_ip; flush_input
+    [ -z "$bind_ip" ] && bind_ip="127.0.0.1"
+
+    local port
+    while true; do
+        echo -n -e "${YELLOW}监听端口 (默认 10053): ${NC}"; read port; flush_input
+        [ -z "$port" ] && port=10053
+        [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ] && break
+        echo -e "${RED}无效端口${NC}"
+    done
+
+    if [ "$dns_mode" = "2" ]; then
+        # 转发模式：本地 dns:// 监听，通过 -F 转发到远程
+        echo -e "${YELLOW}远程转发地址格式，例如:${NC}"
+        echo -e "  socks5+wss://user:pass@your-vps.com:443?path=/dns"
+        echo -e "  relay+wss://your-vps.com:443?path=/dns"
+        echo -e "  http+tls://user:pass@vps:8443"
+        echo -n -e "${YELLOW}远程转发地址: ${NC}"
+        read remote_forward; flush_input
+        [ -z "$remote_forward" ] && { echo -e "${RED}远程地址不能为空${NC}"; return 1; }
+
+        local listen_addr="${bind_ip}:${port}"
+        local cmd="$GOST_BIN -L dns://${listen_addr} -F $remote_forward"
+        local info="DNS 代理 (转发模式): ${listen_addr} -> ${remote_forward}"
+        start_gost_generic "$cmd" "$info"
+        echo -e "${YELLOW}启动后请将系统 DNS 设置为 ${bind_ip}:${port}${NC}"
+        return
+    fi
+
+    # 直接 DoH 模式
+    echo -n -e "${YELLOW}上游 DoH 地址 (默认 https://doh.pub/dns-query): ${NC}"
+    read doh_url; flush_input
+    [ -z "$doh_url" ] && doh_url="https://doh.pub/dns-query"
+
+    local doh_domain=$(echo "$doh_url" | sed -E 's|https?://([^/]+).*|\1|')
+    echo -e "${YELLOW}重要提示：为避免 DNS 污染，请先在 hosts 文件中添加：${NC}"
+    echo -e "${GREEN}120.53.53.53 ${doh_domain}${NC}  (请将 IP 替换为 ${doh_domain} 的真实 IP)"
+
+    local cache_enabled=""
+    echo -n -e "${YELLOW}是否启用 DNS 缓存？[y/N]: ${NC}"
+    read use_cache; flush_input
+    local cache_value=""
+    if [[ "$use_cache" =~ ^[Yy]$ ]]; then
+        echo -n -e "${YELLOW}缓存时间 (默认 60s): ${NC}"
+        read cache_value; flush_input
+        [ -z "$cache_value" ] && cache_value="60s"
+    fi
+
+    local params=()
+    [ -n "$doh_url" ] && params+=("dns=${doh_url}")
+    [ -n "$cache_value" ] && params+=("cache=${cache_value}")
+    local query=$(build_query_string "${params[@]}")
+
+    local listen_addr="${bind_ip}:${port}"
+    local cmd="$GOST_BIN -L dns://${listen_addr}${query}"
+    local info="DNS 代理 (DoH): ${listen_addr} -> ${doh_url}"
+    [ -n "$cache_value" ] && info="${info} (缓存: ${cache_value})"
+
+    start_gost_generic "$cmd" "$info"
+    echo -e "${YELLOW}启动后请将系统 DNS 设置为 ${bind_ip}:${port}${NC}"
+}
+
+# ---------- WebSocket ----------
+configure_websocket() {
+    local port
+    while true; do
+        echo -n -e "${YELLOW}监听端口: ${NC}"; read port; flush_input
+        [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ] && break
+        echo -e "${RED}无效端口${NC}"
+    done
+
+    echo -e "${YELLOW}WebSocket 路径 (默认 /ws, 0=无路径): ${NC}"
+    echo -n -e "${YELLOW}路径 (必须以 / 开头): ${NC}"; read path_input; flush_input
+    GOST_WS_PATH=""
+    if [ -z "$path_input" ]; then
+        GOST_WS_PATH="/ws"
+    elif [ "$path_input" = "0" ]; then
+        GOST_WS_PATH=""
+    else
+        GOST_WS_PATH=$(ensure_leading_slash "$path_input")
+    fi
+    echo -e "${GREEN}当前路径: ${GOST_WS_PATH:-无}${NC}"
+
+    local proto_combo="" proto_label=""
+    local combo_user="" combo_pass="" ss_method="" ss_pass="" ss_name=""
+    if is_v3; then
+        echo -e "${YELLOW}v3 支持组合协议:${NC}"
+        echo -e " 1) HTTP over WS"
+        echo -e " 2) SOCKS5 over WS"
+        echo -e " 3) Shadowsocks over WS"
+        echo -e " 4) 纯隧道"
+        echo -n -e "${YELLOW}请选择 [1-4] (默认 4): ${NC}"; read combo; flush_input
+        case $combo in
+            1) proto_combo="http+ws"; proto_label="HTTP" ;;
+            2) proto_combo="socks5+ws"; proto_label="SOCKS5" ;;
+            3) proto_combo="ss+ws"; proto_label="Shadowsocks" ;;
+            *) proto_combo="" ;;
+        esac
+        if [[ "$proto_combo" == "http+ws" || "$proto_combo" == "socks5+ws" ]]; then
+            echo -n -e "${YELLOW}是否需要认证？[y/N]: ${NC}"; read need_auth; flush_input
+            if [[ "$need_auth" =~ ^[Yy]$ ]]; then
+                while true; do
+                    echo -n -e "${YELLOW}用户名 (默认 admin): ${NC}"; read combo_user
+                    echo -n -e "${YELLOW}密码 (默认 123456): ${NC}"; read combo_pass
+                    [ -z "$combo_user" ] && combo_user="admin"
+                    [ -z "$combo_pass" ] && combo_pass="123456"
+                    [[ "$combo_user" =~ [:@/] || "$combo_pass" =~ [:@/] ]] && echo -e "${RED}不能包含 :@/${NC}" || break
+                done
+                flush_input
+            fi
+        elif [[ "$proto_combo" == "ss+ws" ]]; then
+            local methods=("aes-256-gcm" "aes-128-gcm" "chacha20-ietf-poly1305")
+            echo -e "选择加密: 1) aes-256-gcm 2) aes-128-gcm 3) chacha20-ietf-poly1305"
+            echo -n -e "${YELLOW}默认 1: ${NC}"; read mch; flush_input; [ -z "$mch" ] && mch=1
+            ss_method="${methods[$((mch-1))]}" 2>/dev/null || ss_method="aes-256-gcm"
+            while true; do
+                echo -n -e "${YELLOW}密码 (默认 123456): ${NC}"; read ss_pass; flush_input
+                [ -z "$ss_pass" ] && ss_pass="123456"
+                [[ "$ss_pass" =~ [:@/] ]] && echo -e "${RED}密码含特殊字符${NC}" || break
+            done
+            echo -n -e "${YELLOW}节点名称 (默认 GOST-SS-WS): ${NC}"; read ss_name; flush_input
+            [ -z "$ss_name" ] && ss_name="GOST-SS-WS"
+        fi
+    fi
+
+    local dns_input=""
+    echo -n -e "${YELLOW}自定义 DNS？[y/N]: ${NC}"; read use_dns; flush_input
+    if [[ "$use_dns" =~ ^[Yy]$ ]]; then
+        echo -e "格式: udp://8.8.8.8:53  tcp://8.8.8.8:53  tls://1.1.1.1:853  https://1.1.1.1/dns-query"
+        echo -n -e "${YELLOW}DNS 地址 (默认 https://1.1.1.1/dns-query): ${NC}"
+        read dns_input; flush_input
+        [ -z "$dns_input" ] && dns_input="https://1.1.1.1/dns-query"
+    fi
+
+    local listen_addr=""
+    if [ -n "$proto_combo" ]; then
+        listen_addr="${proto_combo}://"
+        if [[ "$proto_combo" == "ss+ws" ]]; then
+            listen_addr="${listen_addr}${ss_method}:${ss_pass}@:${port}"
+        else
+            [ -n "$combo_user" ] && listen_addr="${listen_addr}${combo_user}:${combo_pass}@"
+            listen_addr="${listen_addr}:${port}"
+        fi
+    else
+        listen_addr="ws://:${port}"
+    fi
+
+    local params=()
+    [ -n "$GOST_WS_PATH" ] && params+=("path=${GOST_WS_PATH}")
+    local query=$(build_query_string "${params[@]}")
+    local dns_query=$(gost_dns_arg "$dns_input")
+    local final_query=$(merge_queries "$query" "$dns_query")
+
+    local cmd="$GOST_BIN -L ${listen_addr}${final_query}"
+    local ip=$(get_local_ip)
+    local info=""
+    [ -n "$proto_combo" ] && info="${proto_label} over WebSocket: ${proto_combo}://${ip}:${port}" || info="WebSocket: ws://${ip}:${port}"
+    [ -n "$GOST_WS_PATH" ] && info="${info}${GOST_WS_PATH}"
+    [ -n "$dns_input" ] && info="${info} (DNS: ${dns_input})"
+
+    if [[ "$proto_combo" == "ss+ws" ]]; then
+        local ss_base="${ss_method}:${ss_pass}@${ip}:${port}"
+        local ss_b64=""
+        if command -v base64 >/dev/null 2>&1; then
+            ss_b64=$(echo -n "$ss_base" | base64 -w 0 2>/dev/null || echo -n "$ss_base" | base64)
+        elif command -v openssl >/dev/null 2>&1; then
+            ss_b64=$(echo -n "$ss_base" | openssl base64 -A 2>/dev/null)
+        fi
+        if [ -n "$ss_b64" ]; then
+            local ss_link="ss://${ss_b64}"
+            [ -n "$ss_name" ] && ss_link="${ss_link}#${ss_name}"
+            info="${info}\nBase64: ${ss_link}"
+        fi
+    fi
+
+    start_gost_generic "$cmd" "$info"
+}
+
+# ---------- 链式代理 ----------
+configure_chain() {
+    echo -e "${BLUE}本地代理类型:${NC} 1) HTTP  2) SOCKS5"
+    echo -n -e "${YELLOW}选择 [1-2]: ${NC}"; read local_type; flush_input
+    local local_proto="http"
+    case $local_type in
+        1) local_proto="http" ;;
+        2) local_proto="socks5" ;;
+        *) echo -e "${RED}无效，使用 HTTP${NC}" ;;
+    esac
+
+    local local_port
+    while true; do
+        echo -n -e "${YELLOW}本地监听端口: ${NC}"; read local_port; flush_input
+        [[ "$local_port" =~ ^[0-9]+$ ]] && [ "$local_port" -ge 1 ] && [ "$local_port" -le 65535 ] && break
+        echo -e "${RED}无效端口${NC}"
+    done
+
+    echo -n -e "${YELLOW}本地是否需要认证？[y/N]: ${NC}"; read local_auth; flush_input
+    local local_user="" local_pass=""
+    if [[ "$local_auth" =~ ^[Yy]$ ]]; then
+        while true; do
+            echo -n -e "${YELLOW}本地用户名 (默认 admin): ${NC}"; read local_user
+            echo -n -e "${YELLOW}本地密码 (默认 123456): ${NC}"; read local_pass
+            [ -z "$local_user" ] && local_user="admin"
+            [ -z "$local_pass" ] && local_pass="123456"
+            [[ "$local_user" =~ [:@/] || "$local_pass" =~ [:@/] ]] && echo -e "${RED}含特殊字符，重输${NC}" || break
+        done
+        flush_input
+    fi
+
+    local local_listen=""
+    if [ -n "$local_user" ]; then
+        local_listen="-L ${local_proto}://${local_user}:${local_pass}@:${local_port}"
+        local_listen_arg="${local_user}:${local_pass}@:${local_port}"
+    else
+        local_listen="-L ${local_proto}://:${local_port}"
+        local_listen_arg=":${local_port}"
+    fi
+
+    local remote_proto="ws" remote_user="" remote_pass="" remote_ss_method="" remote_ss_pass=""
+    if is_v3; then
+        echo -e "${YELLOW}远程 WS 协议组合:${NC} 1) 纯隧道  2) HTTP over WS  3) SOCKS5 over WS  4) SS over WS"
+        echo -n -e "${YELLOW}选择 [1-4] (默认 1): ${NC}"; read remote_combo; flush_input
+        case $remote_combo in
+            2) remote_proto="http+ws" ;;
+            3) remote_proto="socks5+ws" ;;
+            4) remote_proto="ss+ws" ;;
+            *) remote_proto="ws" ;;
+        esac
+        if [[ "$remote_proto" == "http+ws" || "$remote_proto" == "socks5+ws" ]]; then
+            echo -n -e "${YELLOW}远程需要认证？[y/N]: ${NC}"; read need_auth; flush_input
+            if [[ "$need_auth" =~ ^[Yy]$ ]]; then
+                while true; do
+                    echo -n -e "${YELLOW}用户名 (默认 admin): ${NC}"; read remote_user
+                    echo -n -e "${YELLOW}密码 (默认 123456): ${NC}"; read remote_pass
+                    [ -z "$remote_user" ] && remote_user="admin"
+                    [ -z "$remote_pass" ] && remote_pass="123456"
+                    [[ "$remote_user" =~ [:@/] || "$remote_pass" =~ [:@/] ]] && echo -e "${RED}含特殊字符${NC}" || break
+                done
+                flush_input
+            fi
+        elif [ "$remote_proto" = "ss+ws" ]; then
+            local methods=("aes-256-gcm" "aes-128-gcm" "chacha20-ietf-poly1305")
+            echo -e "加密: 1) aes-256-gcm 2) aes-128-gcm 3) chacha20-ietf-poly1305"
+            echo -n -e "${YELLOW}选择 (默认 1): ${NC}"; read mch; flush_input; [ -z "$mch" ] && mch=1
+            remote_ss_method="${methods[$((mch-1))]}" 2>/dev/null || remote_ss_method="aes-256-gcm"
+            while true; do
+                echo -n -e "${YELLOW}密码 (默认 123456): ${NC}"; read remote_ss_pass; flush_input
+                [ -z "$remote_ss_pass" ] && remote_ss_pass="123456"
+                [[ "$remote_ss_pass" =~ [:@/] ]] && echo -e "${RED}含特殊字符${NC}" || break
+            done
+        fi
+    fi
+
+    echo -n -e "${YELLOW}使用加密 WebSocket (wss)？[y/N]: ${NC}"; read use_wss; flush_input
+    if [[ "$use_wss" =~ ^[Yy]$ ]]; then
+        if [ "$remote_proto" = "ws" ]; then
+            remote_proto="wss"
+        elif [[ "$remote_proto" =~ \+ws$ ]]; then
+            remote_proto="${remote_proto/\+ws/+wss}"
+        fi
+    fi
+
+    echo -n -e "${YELLOW}远程服务器地址 (仅主机名/IP，不含协议): ${NC}"; read remote_host; flush_input
+    [ -z "$remote_host" ] && { echo -e "${RED}不能为空${NC}"; return 1; }
+    echo -n -e "${YELLOW}远程端口: ${NC}"; read remote_port; flush_input
+    [[ ! "$remote_port" =~ ^[0-9]+$ || "$remote_port" -lt 1 || "$remote_port" -gt 65535 ]] && { echo -e "${RED}端口无效${NC}"; return 1; }
+
+    echo -e "${YELLOW}WebSocket 路径 (默认 /ws, 0=无): ${NC}"
+    echo -n -e "${YELLOW}路径 (必须以 / 开头): ${NC}"; read path_input; flush_input
+    local remote_path=""
+    if [ -z "$path_input" ]; then
+        remote_path="/ws"
+    elif [ "$path_input" = "0" ]; then
+        remote_path=""
+    else
+        remote_path=$(ensure_leading_slash "$path_input")
+    fi
+    echo -e "${GREEN}当前路径: ${remote_path:-无}${NC}"
+
+    local dns_input=""
+    echo -n -e "${YELLOW}自定义 DNS？[y/N]: ${NC}"; read use_dns; flush_input
+    if [[ "$use_dns" =~ ^[Yy]$ ]]; then
+        echo -e "格式: udp://8.8.8.8:53 tcp://8.8.8.8:53 tls://1.1.1.1:853 https://1.1.1.1/dns-query"
+        echo -n -e "${YELLOW}DNS 地址 (默认 https://1.1.1.1/dns-query): ${NC}"
+        read dns_input; flush_input
+        [ -z "$dns_input" ] && dns_input="https://1.1.1.1/dns-query"
+    fi
+
+    local remote_url=""
+    case "$remote_proto" in
+        ws|wss) remote_url="${remote_proto}://${remote_host}:${remote_port}" ;;
+        http+ws|http+wss|socks5+ws|socks5+wss)
+            remote_url="${remote_proto}://"
+            [ -n "$remote_user" ] && remote_url="${remote_url}${remote_user}:${remote_pass}@"
+            remote_url="${remote_url}${remote_host}:${remote_port}"
+            ;;
+        ss+ws|ss+wss)
+            remote_url="${remote_proto}://${remote_ss_method}:${remote_ss_pass}@${remote_host}:${remote_port}"
+            ;;
+    esac
+    local params=(); [ -n "$remote_path" ] && params+=("path=${remote_path}")
+    local query=$(build_query_string "${params[@]}")
+    local dns_query=$(gost_dns_arg "$dns_input")
+    local final_query=$(merge_queries "$query" "$dns_query")
+    remote_url="${remote_url}${final_query}"
+
+    local cmd="$GOST_BIN $local_listen -F $remote_url"
+    local info="链式代理: ${local_proto}://${local_listen_arg} -> ${remote_url}"
+    start_gost_generic "$cmd" "$info"
+}
+
+start_gost_legacy() {
+    local protocol=$1 port=$2 auth1=$3 auth2=$4 name=$5 dns_input=$6
+    cd "$GOST_DIR" || return 1
+    stop_gost
+
+    local dns_query=$(gost_dns_arg "$dns_input")
+    local final_query=$(merge_queries "" "$dns_query")
+    local cmd="" proxy_url="" ip=$(get_local_ip)
+
+    case $protocol in
+        1) if [ -n "$auth1" ]; then
+               cmd="$GOST_BIN -L http://${auth1}:${auth2}@:${port}${final_query}"
+               proxy_url="http://${auth1}:${auth2}@${ip}:${port}"
+           else
+               cmd="$GOST_BIN -L http://:${port}${final_query}"
+               proxy_url="http://${ip}:${port}"
+           fi ;;
+        2) if [ -n "$auth1" ]; then
+               cmd="$GOST_BIN -L socks5://${auth1}:${auth2}@:${port}${final_query}"
+               proxy_url="socks5://${auth1}:${auth2}@${ip}:${port}"
+           else
+               cmd="$GOST_BIN -L socks5://:${port}${final_query}"
+               proxy_url="socks5://${ip}:${port}"
+           fi ;;
+        3) if [ -n "$auth1" ]; then
+               cmd="$GOST_BIN -L ${auth1}:${auth2}@:${port}${final_query}"
+               proxy_url="http://${auth1}:${auth2}@${ip}:${port} / socks5://${auth1}:${auth2}@${ip}:${port}"
+           else
+               cmd="$GOST_BIN -L :${port}${final_query}"
+               proxy_url="http://${ip}:${port} / socks5://${ip}:${port}"
+           fi ;;
+        4) cmd="$GOST_BIN -L ss://${auth1}:${auth2}@:${port}${final_query}"
+           local ss_link="${auth1}:${auth2}@${ip}:${port}"
+           local extra=""
+           if command -v base64 >/dev/null 2>&1; then
+               extra=$(echo -n "$ss_link" | base64 -w 0 2>/dev/null || echo -n "$ss_link" | base64)
+           elif command -v openssl >/dev/null 2>&1; then
+               extra=$(echo -n "$ss_link" | openssl base64 -A 2>/dev/null)
+           fi
+           proxy_url="ss://${auth1}:${auth2}@${ip}:${port}"
+           [ -n "$name" ] && proxy_url="${proxy_url}#${name}"
+           if [ -n "$extra" ]; then
+               extra="ss://${extra}"
+               [ -n "$name" ] && extra="${extra}#${name}"
+           fi
+           ;;
+    esac
+    [ -n "$dns_input" ] && proxy_url="${proxy_url} (DNS: ${dns_input})"
+
+    echo "$cmd" > "$GOST_CMD_FILE"
+    echo "=== GOST 启动于 $(date) ===" > "$GOST_LOG"
+    echo "命令: $cmd" >> "$GOST_LOG"
+    echo "信息: $proxy_url" >> "$GOST_LOG"
+    nohup $cmd >> "$GOST_LOG" 2>&1 &
+    local pid=$!
+    echo $pid > "$GOST_PID_FILE"
+    sleep 2
+    if pgrep -f "$GOST_BIN" >/dev/null 2>&1; then
+        echo -e "${GREEN}✓ 运行中 (PID: $pid)${NC}"
+        echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+        echo -e "${GREEN}代理链接:${NC}\n${YELLOW}${proxy_url}${NC}"
+        if [ "$protocol" -eq 4 ]; then
+            if [ -n "$extra" ]; then
+                echo -e "${GREEN}Base64:${NC}\n${YELLOW}${extra}${NC}"
+                save_node_info "${proxy_url}"$'\n'"Base64: ${extra}"
+            else
+                echo -e "${YELLOW}Base64 编码不可用，已保存普通链接${NC}"
+                save_node_info "$proxy_url"
+            fi
+        else
+            save_node_info "$proxy_url"
+        fi
+        echo -e "${BLUE}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+        echo "PID: $pid 启动成功" >> "$GOST_LOG"
+        return 0
+    else
+        echo -e "${RED}启动失败，最后几行日志:${NC}"
+        tail -5 "$GOST_LOG"
+        echo -e "${RED}查看完整日志: ${GOST_LOG}${NC}"
+        return 1
+    fi
+}
+
+custom_command() {
+    if [ ! -f "$GOST_BIN" ] || [ ! -x "$GOST_BIN" ]; then
+        echo -e "${RED}未检测到 GOST，请先安装。${NC}"
+        flush_input; read -n 1 -p "按任意键返回..."; return 1
+    fi
+
+    local ver=$(get_installed_gost_version)
+    echo -e "${GREEN}当前 GOST 版本: ${ver}${NC}"
+    echo -n -e "${YELLOW}你是否熟悉 GOST $(is_v3 && echo 'v3' || echo 'v2') 的命令语法？[y/N]: ${NC}"
+    read familiar; flush_input
+    if [[ ! "$familiar" =~ ^[Yy]$ ]]; then
+        echo -e "${RED}请先熟悉命令语法后再使用此功能。${NC}"
+        flush_input; read -n 1 -p "按任意键返回..."
+        return 1
+    fi
+
+    echo -e "${YELLOW}请输入完整的 GOST 命令行 (不需要包含 nohup 和重定向):${NC}"
+    echo -e "${YELLOW}示例: gost -L http://:8080${NC}"
+    echo -e "${YELLOW}示例: gost -L socks5://user:pass@:1080${NC}"
+    echo -e "${YELLOW}示例: gost -L dns://:10053?dns=https://doh.pub/dns-query&cache=60s${NC}"
+    read -e custom_cmd
+    flush_input
+    [ -z "$custom_cmd" ] && { echo -e "${RED}命令不能为空${NC}"; flush_input; read -n 1 -p "按任意键返回..."; return 1; }
+
+    if [[ "$custom_cmd" == gost* ]]; then
+        custom_cmd="${GOST_BIN}${custom_cmd#gost}"
+    fi
+
+    start_gost_generic "$custom_cmd" "自定义命令"
+}
+
+configure_proxy() {
+    local skip_confirm=$1
+    if [ ! -f "$GOST_BIN" ] || [ ! -x "$GOST_BIN" ]; then
+        echo -e "${RED}未检测到 GOST，请先安装。${NC}"
+        echo -n -e "${YELLOW}是否现在安装？[y/N]: ${NC}"; read ans; flush_input
+        if [[ "$ans" =~ ^[Yy]$ ]]; then
+            select_version_to_install || { flush_input; read -n 1 -p "按任意键返回..."; return 1; }
+            [ ! -f "$GOST_BIN" ] && { flush_input; read -n 1 -p "安装失败..."; return 1; }
+        else
+            flush_input; read -n 1 -p "按任意键返回..."; return 1
+        fi
+    fi
+
+    if [ "$skip_confirm" != "auto" ]; then
+        local ver=$(get_installed_gost_version)
+        echo -e "${GREEN}当前版本: ${ver}${NC}"
+        if pgrep -f "$GOST_BIN" >/dev/null 2>&1; then
+            echo -e "${YELLOW}运行中 PID: $(pgrep -f "$GOST_BIN" | head -1)，重新配置将停止旧进程。${NC}"
+        fi
+        echo -n -e "${YELLOW}是否重新配置？[y/N]: ${NC}"; read ans; flush_input
+        [[ ! "$ans" =~ ^[Yy]$ ]] && { flush_input; read -n 1 -p "按任意键返回..."; return 1; }
+    fi
+
+    echo -e "${BLUE}========================================${NC}"
+    echo -e "          配置代理"
+    echo -e "${BLUE}========================================${NC}"
+    echo -e " 1) HTTP"
+    echo -e " 2) SOCKS5"
+    echo -e " 3) 自适应 (HTTP/SOCKS5)"
+    echo -e " 4) Shadowsocks"
+    echo -e " 5) WebSocket"
+    echo -e " 6) 链式代理 (HTTP/SOCKS5 -> WS/WSS)"
+    echo -e " 7) 自定义命令"
+    echo -e " 8) DNS 代理 (DoH / 转发)"
+    echo -n -e "${YELLOW}请选择 [1-8]: ${NC}"; read protocol; flush_input
+    [[ ! "$protocol" =~ ^[1-8]$ ]] && protocol=3
+
+    case $protocol in
+        1|2|3|4)
+            local port
+            while true; do
+                echo -n -e "${YELLOW}端口: ${NC}"; read port; flush_input
+                [[ "$port" =~ ^[0-9]+$ && "$port" -ge 1 && "$port" -le 65535 ]] && break
+                echo -e "${RED}无效端口${NC}"
+            done
+            local username="admin" password="123456" method="aes-256-gcm" node_name=""
+            local dns_input=""
+            if [ "$protocol" -ne 4 ]; then
+                echo -n -e "${YELLOW}是否需要认证？[Y/n]: ${NC}"; read need_auth; flush_input
+                if [[ "$need_auth" =~ ^[Nn]$ ]]; then
+                    username=""
+                    password=""
+                else
+                    while true; do
+                        echo -n -e "${YELLOW}账号 (默认 admin): ${NC}"; read username; flush_input
+                        [ -z "$username" ] && username="admin"
+                        echo -n -e "${YELLOW}密码 (默认 123456): ${NC}"; read password; flush_input
+                        [ -z "$password" ] && password="123456"
+                        [[ "$username" =~ [:@/] || "$password" =~ [:@/] ]] && echo -e "${RED}含特殊字符${NC}" || break
+                    done
+                fi
+            else
+                echo -e "${BLUE}Shadowsocks 配置${NC}"
+                local gost_ver=$(get_installed_gost_version)
+                local ss_methods=() ss_names=()
+                if version_ge "$gost_ver" "2.8.0"; then
+                    ss_methods=("aes-256-gcm" "aes-128-gcm" "chacha20-ietf-poly1305")
+                    ss_names=("aes-256-gcm (推荐)" "aes-128-gcm" "chacha20-ietf-poly1305 (推荐)")
+                    echo -e "${GREEN}支持 AEAD 加密${NC}"
+                else
+                    echo -e "${RED}版本低于 2.8，不支持 SS，请升级。${NC}"; flush_input; read -n 1 -p "按任意键返回..."; return 1
+                fi
+                for i in "${!ss_names[@]}"; do echo "  $((i+1))) ${ss_names[$i]}"; done
+                echo -n -e "${YELLOW}加密方式 (默认 1): ${NC}"; read mch; flush_input; [ -z "$mch" ] && mch=1
+                [[ "$mch" -ge 1 && "$mch" -le 3 ]] && method="${ss_methods[$((mch-1))]}" || method="aes-256-gcm"
+                while true; do
+                    echo -n -e "${YELLOW}密码 (默认 123456): ${NC}"; read password; flush_input
+                    [ -z "$password" ] && password="123456"
+                    [[ "$password" =~ [:@/] ]] && echo -e "${RED}含特殊字符${NC}" || break
+                done
+                echo -n -e "${YELLOW}节点名称 (默认 GOST-SS): ${NC}"; read node_name; flush_input
+                [ -z "$node_name" ] && node_name="GOST-SS"
+            fi
+
+            echo -n -e "${YELLOW}自定义 DNS？[y/N]: ${NC}"; read use_dns; flush_input
+            if [[ "$use_dns" =~ ^[Yy]$ ]]; then
+                echo -e "格式: udp://8.8.8.8:53  tcp://8.8.8.8:53  tls://1.1.1.1:853  https://1.1.1.1/dns-query"
+                echo -n -e "${YELLOW}DNS 地址 (默认 https://1.1.1.1/dns-query): ${NC}"
+                read dns_input; flush_input
+                [ -z "$dns_input" ] && dns_input="https://1.1.1.1/dns-query"
+            fi
+
+            if [ "$protocol" -eq 4 ]; then
+                start_gost_legacy "$protocol" "$port" "$method" "$password" "$node_name" "$dns_input"
+            else
+                start_gost_legacy "$protocol" "$port" "$username" "$password" "" "$dns_input"
+            fi
+            ;;
+        5) configure_websocket ;;
+        6) configure_chain ;;
+        7) custom_command ;;
+        8) configure_dns ;;
+    esac
+
+    echo -n -e "${YELLOW}开启开机自启？[y/N]: ${NC}"; read auto_start; flush_input
+    [[ "$auto_start" =~ ^[Yy]$ ]] && enable_autostart
+    flush_input; read -n 1 -p "按任意键返回菜单..."
+}
+
+enable_autostart() {
+    local cron_now=$(crontab -l 2>/dev/null | grep -v "$GOST_DIR")
+    cat > "$GOST_DIR/keepalive.sh" << EOF
+#!/usr/bin/env bash
+GOST_DIR="$GOST_DIR"
+cd "\$GOST_DIR"
+if [ -f gost.pid ] && kill -0 \$(cat gost.pid) 2>/dev/null; then exit 0; fi
+if ! pgrep -f "\$GOST_DIR/gost" >/dev/null; then
+    if [ -f start_cmd.txt ]; then
+        cmd=\$(cat start_cmd.txt)
+        nohup \$cmd >> gost.log 2>&1 &
+        echo \$! > gost.pid
+    fi
+fi
+EOF
+    chmod +x "$GOST_DIR/keepalive.sh"
+    (echo "$cron_now"; echo "@reboot $GOST_DIR/keepalive.sh"; echo "*/5 * * * * $GOST_DIR/keepalive.sh") | crontab -
+    echo -e "${GREEN}✓ 已配置自启和保活${NC}"
+}
+
+uninstall_gost() {
+    echo -e "${YELLOW}卸载 GOST...${NC}"
+    stop_gost
+    crontab -l 2>/dev/null | grep -v "$GOST_DIR" | crontab -
+    rm -rf "$GOST_DIR"
+    echo -e "${GREEN}✓ 卸载完成${NC}"
+}
+
+show_status() {
+    echo -e "${BLUE}========================================${NC}"
+    echo -e "          系统状态"
+    echo -e "${BLUE}========================================${NC}"
+    echo -e "本机 IP: ${YELLOW}$(get_local_ip)${NC}"
+    if [ -f "$GOST_BIN" ]; then
+        echo -e "GOST: 已安装"
+        echo -e "版本: $("$GOST_BIN" -V 2>&1 | head -1)"
+        if pgrep -f "$GOST_BIN" >/dev/null 2>&1; then
+            echo -e "状态: ${GREEN}运行中 ✓${NC}  PID: $(pgrep -f "$GOST_BIN" | head -1)"
+        else
+            echo -e "状态: ${RED}未运行 ✗${NC}"
+        fi
+    else
+        echo -e "${RED}GOST 未安装${NC}"
+    fi
+    flush_input; read -n 1 -p "按任意键返回..."
+}
+
+show_sub() {
+    echo -e "${BLUE}========================================${NC}"
+    echo -e "          节点信息"
+    echo -e "${BLUE}========================================${NC}"
+    if [ -f "$SUBFILE" ] && [ -s "$SUBFILE" ]; then
+        echo -e "${YELLOW}$(cat "$SUBFILE")${NC}"
+    else
+        echo -e "${RED}暂无节点信息${NC}"
+    fi
+    flush_input; read -n 1 -p "按任意键返回..."
+}
+
+view_log() {
+    [ ! -f "$GOST_LOG" ] && { echo -e "${RED}日志文件不存在${NC}"; flush_input; read -n 1 -p "按任意键返回..."; return; }
+    echo -n -e "${YELLOW}显示行数 (默认 50): ${NC}"; read lines; flush_input
+    [[ "$lines" =~ ^[0-9]+$ ]] || lines=50
+    tail -n "$lines" "$GOST_LOG"
+    echo -n -e "${YELLOW}实时跟踪？[y/N]: ${NC}"; read follow; flush_input
+    if [[ "$follow" =~ ^[Yy]$ ]]; then
+        tail -f "$GOST_LOG"
+    else
+        flush_input; read -n 1 -p "按任意键返回..."
+    fi
+}
+
+update_script() {
+    local url="https://raw.githubusercontent.com/goyo123321a/gost-manager/refs/heads/main/gost-manager.sh"
+    local tmp="/tmp/gost-manager-update.sh"
+    echo -e "${YELLOW}下载最新脚本...${NC}"
+    if wget -q --timeout=30 -O "$tmp" "$url" 2>/dev/null || curl -fsSL --connect-timeout 30 "$url" -o "$tmp" 2>/dev/null; then
+        if [ -s "$tmp" ]; then
+            cp "$tmp" "$0" && chmod +x "$0" && rm -f "$tmp"
+            echo -e "${GREEN}✓ 更新成功！${NC}"
+            echo -e "${YELLOW}请重新运行脚本，快速命令: ${GREEN}~/gost-manager.sh${NC} 或 ${GREEN}bash ~/gost-manager.sh${NC}"
+            flush_input; read -n 1 -p "按任意键退出..."
+            exit 0
+        else
+            echo -e "${RED}下载的文件为空，更新失败。${NC}"
+        fi
+    else
+        echo -e "${RED}自动下载失败，可能是网络问题。${NC}"
+    fi
+    echo -e "${YELLOW}请手动执行以下命令更新脚本：${NC}"
+    echo -e "${GREEN}curl -fsSL ${url} -o ~/gost-manager.sh && chmod +x ~/gost-manager.sh${NC}"
+    echo -e "${YELLOW}然后重新运行 ${GREEN}~/gost-manager.sh${NC}"
+    flush_input; read -n 1 -p "按任意键退出..."
+    exit 1
+}
+
+show_menu() {
+    echo
+    echo -e "${BLUE}╔══════════════════════════════════════╗${NC}"
+    echo -e "${BLUE}║        GOST 一键管理脚本            ║${NC}"
+    echo -e "${BLUE}╠══════════════════════════════════════╣${NC}"
+    echo -e "${BLUE}║  ${GREEN}1${BLUE}) 安装 GOST                       ║${NC}"
+    echo -e "${BLUE}║  ${GREEN}2${BLUE}) 配置代理                       ║${NC}"
+    echo -e "${BLUE}║  ${GREEN}3${BLUE}) 查看状态                       ║${NC}"
+    echo -e "${BLUE}║  ${GREEN}4${BLUE}) 卸载 GOST                       ║${NC}"
+    echo -e "${BLUE}║  ${GREEN}5${BLUE}) 更新脚本                       ║${NC}"
+    echo -e "${BLUE}║  ${GREEN}6${BLUE}) 查看节点信息                   ║${NC}"
+    echo -e "${BLUE}║  ${GREEN}7${BLUE}) 停止 GOST                       ║${NC}"
+    echo -e "${BLUE}║  ${GREEN}8${BLUE}) 查看日志                       ║${NC}"
+    echo -e "${BLUE}║  ${GREEN}0${BLUE}) 退出                           ║${NC}"
+    echo -e "${BLUE}╚══════════════════════════════════════╝${NC}"
+    echo -n -e "${YELLOW}请输入 [0-8]: ${NC}"
+}
+
+main() {
+    detect_os_arch
+    while true; do
+        flush_input
+        show_menu
+        read choice
+        case $choice in
+            1) select_version_to_install
+               if [ -f "$GOST_BIN" ]; then
+                   echo
+                   echo -n -e "${GREEN}是否配置代理？[Y/n]: ${NC}"
+                   read config_now; flush_input
+                   [[ -z "$config_now" || "$config_now" =~ ^[Yy]$ ]] && configure_proxy "auto"
+               fi ;;
+            2) configure_proxy ;;
+            3) show_status ;;
+            4) uninstall_gost; flush_input; read -n 1 -p "按任意键返回..." ;;
+            5) update_script ;;
+            6) show_sub ;;
+            7) stop_gost; flush_input; read -n 1 -p "按任意键返回..." ;;
+            8) view_log ;;
+            0) echo -e "${GREEN}再见！${NC}"; exit 0 ;;
+            *) echo -e "${RED}无效选择${NC}"; sleep 1 ;;
+        esac
+    done
+}
+
+main
