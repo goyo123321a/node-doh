@@ -1,1467 +1,1659 @@
-// ==================== 环境变量默认值 ====================
-const ENV_DEFAULTS = {
-  ADMIN_USER: 'admin',
-  ADMIN_PASS: '123321',
-  CACHE_TTL: 60 * 1000,        // 配置缓存 1 分钟
-  SESSION_TTL: 3600,           // Session 1 小时
-  FASTEST_TIMEOUT: 5000,       // 实时选择超时 5 秒
-  MAX_FAILOVER_ATTEMPTS: 3,    // 故障转移最大尝试次数（已弃用，但保留）
+const express = require('express');
+const session = require('express-session');
+
+const app = express();
+const PORT = process.env.PORT || 7860;
+
+// ============ 管理员配置 ============
+const ADMIN_USER = process.env.ADMIN_USER || 'admin';
+const ADMIN_PASS = process.env.ADMIN_PASS || '123321';
+const SESSION_SECRET = process.env.SESSION_SECRET || 'doh-server-secret-key';
+
+// ============ Session 配置 ============
+app.use(session({
+  secret: SESSION_SECRET,
+  resave: false,
+  saveUninitialized: false,
+  cookie: { secure: false, maxAge: 24 * 60 * 60 * 1000 }
+}));
+
+// ============ DoH 路径配置 ============
+let DoH路径 = process.env.DOH_PATH || process.env.TOKEN || 'dns-query';
+
+if (DoH路径.includes("/")) {
+  const parts = DoH路径.split("/");
+  DoH路径 = parts[parts.length - 1];
+}
+
+if (!DoH路径 || DoH路径.length === 0 || DoH路径 === 'undefined') {
+  DoH路径 = 'dns-query';
+}
+
+DoH路径 = DoH路径.replace(/[^a-zA-Z0-9\-_]/g, '');
+
+console.log(`📡 DoH 端点路径: /${DoH路径}`);
+
+// ============ DNS 记录类型映射 ============
+const recordTypeMap = {
+  'A': 1, 'AAAA': 28, 'CNAME': 5, 'MX': 15, 'TXT': 16, 'NS': 2,
+  'SOA': 6, 'PTR': 12, 'SRV': 33, 'CAA': 257, 'HTTPS': 65, 'ANY': 255
 };
 
-// ==================== 全局缓存 ====================
-let cachedConfig = null;
-let cacheExpiry = 0;
-const CONFIG_KEY = 'config';
-const SESSION_PREFIX = 'session:';
+// ============ 仅 DoH 上游配置 ============
+const upstreamsConfig = [
+  { name: "cloudflare-dns.com", display: "Cloudflare", server: "https://cloudflare-dns.com/dns-query", region: "全球", type: "DoH", priority: 1 },
+  { name: "dns.google", display: "Google", server: "https://dns.google/dns-query", region: "全球", type: "DoH", priority: 2 },
+  { name: "dns.quad9.net", display: "Quad9", server: "https://dns.quad9.net/dns-query", region: "全球", type: "DoH", priority: 3 },
+  { name: "dns.sb", display: "DNS.SB", server: "https://dns.sb/dns-query", region: "全球", type: "DoH", priority: 4 },
+  { name: "alidns.com", display: "阿里云", server: "https://dns.alidns.com/dns-query", region: "中国", type: "DoH", priority: 5 },
+  { name: "doh.pub", display: "腾讯云", server: "https://doh.pub/dns-query", region: "中国", type: "DoH", priority: 6 },
+  { name: "doh.360.cn", display: "360", server: "https://doh.360.cn/dns-query", region: "中国", type: "DoH", priority: 7 },
+  { name: "dns.adguard-dns.com", display: "AdGuard", server: "https://dns.adguard-dns.com/dns-query", region: "全球", type: "DoH+去广告", priority: 8 },
+  { name: "doh.opendns.com", display: "OpenDNS", server: "https://doh.opendns.com/dns-query", region: "全球", type: "DoH", priority: 9 }
+];
 
-// ==================== 核心工具函数 ====================
+const enabledUpstreamsEnv = process.env.ENABLED_UPSTREAMS || 'all';
+let upstreamList = [];
 
-// 从 KV 获取配置（带缓存）
-async function getConfig(env) {
-  if (Date.now() < cacheExpiry && cachedConfig) {
-    return cachedConfig;
-  }
+if (enabledUpstreamsEnv === 'all') {
+  upstreamList = upstreamsConfig;
+} else {
+  const enabledNames = enabledUpstreamsEnv.split(',').map(n => n.trim());
+  upstreamList = upstreamsConfig.filter(u =>
+    enabledNames.includes(u.name) || enabledNames.includes(u.display)
+  );
+  if (upstreamList.length === 0) upstreamList = upstreamsConfig.slice(0, 5);
+}
+
+// 构建上游对象
+const upstreams = upstreamList.map((config, index) => ({
+  id: index,
+  name: config.name,
+  displayName: config.display,
+  server: config.server,
+  region: config.region,
+  type: config.type,
+  timeout: config.region === '中国' ? 2000 : 3000,
+  status: 'checking',
+  lastCheck: null,
+  responseTime: null
+}));
+
+console.log(`\n🌐 配置 DoH 上游总数: ${upstreams.length}`);
+console.log(`📋 上游列表: ${upstreams.map(u => u.displayName).join(', ')}`);
+
+let selectedUpstreamId = null;
+let availableUpstreams = [...upstreams];
+let currentUpstreamIndex = 0;
+let healthCheckRunning = false;
+
+// ============ 健康检查 ============
+async function checkSingleUpstream(upstream) {
+  const startTime = Date.now();
   try {
-    const kv = env.DOH_CONFIG;
-    if (!kv) {
-      console.warn('KV 未绑定，使用内存默认配置');
-      const defaultConfig = {
-        upstreams: [
-          { id: 'cloudflare', name: 'Cloudflare', url: 'https://cloudflare-dns.com/dns-query', enabled: true, region: '全球' },
-          { id: 'google', name: 'Google', url: 'https://dns.google/dns-query', enabled: true, region: '全球' },
-          { id: 'quad9', name: 'Quad9', url: 'https://dns.quad9.net/dns-query', enabled: true, region: '全球' },
-          { id: 'dns_sb', name: 'DNS.SB', url: 'https://dns.sb/dns-query', enabled: true, region: '全球' },
-          { id: 'alidns', name: '阿里云', url: 'https://dns.alidns.com/dns-query', enabled: true, region: '中国' },
-          { id: 'tencent', name: '腾讯云', url: 'https://doh.pub/dns-query', enabled: true, region: '中国' },
-          { id: 'doh_360', name: '360', url: 'https://doh.360.cn/dns-query', enabled: true, region: '中国' },
-          { id: 'adguard', name: 'AdGuard', url: 'https://dns.adguard-dns.com/dns-query', enabled: true, region: '全球' },
-          { id: 'opendns', name: 'OpenDNS', url: 'https://doh.opendns.com/dns-query', enabled: true, region: '全球' }
-        ],
-        default: 'cloudflare',
-        allow_custom: true,
-        doh_path: 'dns-query',
-        enable_auto_select: true
-      };
-      cachedConfig = defaultConfig;
-      cacheExpiry = Date.now() + ENV_DEFAULTS.CACHE_TTL;
-      return defaultConfig;
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), upstream.timeout + 2000);
+    const url = new URL(upstream.server);
+    url.searchParams.set('name', 'google.com');
+    url.searchParams.set('type', 'A');
+    const response = await fetch(url.toString(), {
+      headers: { 'Accept': 'application/dns-json' },
+      signal: controller.signal
+    });
+    clearTimeout(timeoutId);
+
+    const isOnline = response.ok;
+    upstream.status = isOnline ? 'online' : 'offline';
+    upstream.lastCheck = new Date().toISOString();
+    upstream.responseTime = isOnline ? Date.now() - startTime : null;
+
+    if (isOnline && !availableUpstreams.find(u => u.id === upstream.id)) {
+      availableUpstreams.push(upstream);
+    } else if (!isOnline) {
+      availableUpstreams = availableUpstreams.filter(u => u.id !== upstream.id);
     }
-    const data = await kv.get(CONFIG_KEY, 'json');
-    const config = data || {
-      upstreams: [
-        { id: 'cloudflare', name: 'Cloudflare', url: 'https://cloudflare-dns.com/dns-query', enabled: true, region: '全球' },
-        { id: 'google', name: 'Google', url: 'https://dns.google/dns-query', enabled: true, region: '全球' },
-        { id: 'quad9', name: 'Quad9', url: 'https://dns.quad9.net/dns-query', enabled: true, region: '全球' },
-        { id: 'dns_sb', name: 'DNS.SB', url: 'https://dns.sb/dns-query', enabled: true, region: '全球' },
-        { id: 'alidns', name: '阿里云', url: 'https://dns.alidns.com/dns-query', enabled: true, region: '中国' },
-        { id: 'tencent', name: '腾讯云', url: 'https://doh.pub/dns-query', enabled: true, region: '中国' },
-        { id: 'doh_360', name: '360', url: 'https://doh.360.cn/dns-query', enabled: true, region: '中国' },
-        { id: 'adguard', name: 'AdGuard', url: 'https://dns.adguard-dns.com/dns-query', enabled: true, region: '全球' },
-        { id: 'opendns', name: 'OpenDNS', url: 'https://doh.opendns.com/dns-query', enabled: true, region: '全球' }
-      ],
-      default: 'cloudflare',
-      allow_custom: true,
-      doh_path: 'dns-query',
-      enable_auto_select: true
-    };
-    cachedConfig = config;
-    cacheExpiry = Date.now() + ENV_DEFAULTS.CACHE_TTL;
-    return config;
-  } catch (e) {
-    console.error('KV 读取失败，使用默认配置', e);
-    return {
-      upstreams: [
-        { id: 'cloudflare', name: 'Cloudflare', url: 'https://cloudflare-dns.com/dns-query', enabled: true },
-        { id: 'alidns', name: '阿里 DNS', url: 'https://dns.alidns.com/resolve', enabled: true }
-      ],
-      default: 'cloudflare',
-      allow_custom: true,
-      doh_path: 'dns-query',
-      enable_auto_select: true
-    };
-  }
-}
 
-// 保存配置到 KV
-async function saveConfig(env, config) {
-  const kv = env.DOH_CONFIG;
-  if (!kv) {
-    cachedConfig = config;
-    cacheExpiry = Date.now() + ENV_DEFAULTS.CACHE_TTL;
-    return;
-  }
-  await kv.put(CONFIG_KEY, JSON.stringify(config));
-  cachedConfig = config;
-  cacheExpiry = Date.now() + ENV_DEFAULTS.CACHE_TTL;
-}
-
-// Session 管理
-function generateSessionId() {
-  return Date.now().toString(36) + Math.random().toString(36).substring(2, 8);
-}
-
-async function createSession(env, username) {
-  const sid = generateSessionId();
-  const expires = Date.now() + ENV_DEFAULTS.SESSION_TTL * 1000;
-  const kv = env.DOH_CONFIG;
-  if (kv) {
-    await kv.put(`${SESSION_PREFIX}${sid}`, JSON.stringify({ username, expires }), { expirationTtl: ENV_DEFAULTS.SESSION_TTL });
-  }
-  return sid;
-}
-
-async function validateSession(env, request) {
-  const cookie = request.headers.get('Cookie');
-  if (!cookie) return null;
-  const match = cookie.split(';').find(c => c.trim().startsWith('session_id='));
-  if (!match) return null;
-  const sid = match.split('=')[1].trim();
-  const kv = env.DOH_CONFIG;
-  if (!kv) return null;
-  const session = await kv.get(`${SESSION_PREFIX}${sid}`, 'json');
-  if (!session || session.expires < Date.now()) {
-    if (session) await kv.delete(`${SESSION_PREFIX}${sid}`);
-    return null;
-  }
-  return session.username;
-}
-
-async function destroySession(env, request) {
-  const cookie = request.headers.get('Cookie');
-  if (!cookie) return;
-  const match = cookie.split(';').find(c => c.trim().startsWith('session_id='));
-  if (match) {
-    const sid = match.split('=')[1].trim();
-    const kv = env.DOH_CONFIG;
-    if (kv) await kv.delete(`${SESSION_PREFIX}${sid}`);
-  }
-}
-
-// JSON 响应辅助
-function json(data, status = 200) {
-  return new Response(JSON.stringify(data, null, 2), {
-    status,
-    headers: {
-      'Content-Type': 'application/json; charset=UTF-8',
-      'Access-Control-Allow-Origin': '*'
+    if (isOnline) {
+      console.log(`✅ ${upstream.displayName} - ${upstream.responseTime}ms`);
+    } else {
+      console.log(`❌ ${upstream.displayName} - 不可用`);
     }
-  });
+    return isOnline;
+  } catch (err) {
+    upstream.status = 'offline';
+    upstream.lastCheck = new Date().toISOString();
+    upstream.responseTime = null;
+    availableUpstreams = availableUpstreams.filter(u => u.id !== upstream.id);
+    console.log(`❌ ${upstream.displayName} - 不可用 (${err.message})`);
+    return false;
+  }
 }
 
-// 管理员认证中间件
-async function requireAdmin(env, request) {
-  const username = await validateSession(env, request);
-  if (!username) {
-    return new Response('Unauthorized', { status: 401, headers: { 'Content-Type': 'text/plain' } });
+async function healthCheck() {
+  if (healthCheckRunning) return;
+  healthCheckRunning = true;
+
+  console.log(`\n🔍 开始健康检查 (${new Date().toLocaleTimeString()})`);
+
+  const results = await Promise.all(upstreams.map(u => checkSingleUpstream(u)));
+  const onlineCount = results.filter(r => r === true).length;
+
+  if (availableUpstreams.length === 0) {
+    availableUpstreams = [...upstreams];
   }
-  const expected = env.ADMIN_USER || ENV_DEFAULTS.ADMIN_USER;
-  if (username !== expected) {
-    return new Response('Forbidden', { status: 403 });
+
+  availableUpstreams.sort((a, b) => (a.responseTime || 9999) - (b.responseTime || 9999));
+
+  console.log(`📡 在线: ${onlineCount}/${upstreams.length}`);
+  if (availableUpstreams[0]) {
+    console.log(`📡 最快: ${availableUpstreams[0].displayName} (${availableUpstreams[0].responseTime}ms)`);
   }
-  return null; // 通过
+
+  healthCheckRunning = false;
 }
 
-// ==================== DNS 查询核心函数 ====================
+function getCurrentUpstream() {
+  if (selectedUpstreamId !== null) {
+    const selected = upstreams.find(u => u.id === selectedUpstreamId);
+    if (selected && selected.status === 'online') {
+      return selected;
+    }
+    selectedUpstreamId = null;
+  }
 
-// 向指定 DoH 服务器查询单个记录类型
-async function queryDns(dohUrl, domain, type) {
-  const url = new URL(dohUrl);
-  url.searchParams.set('name', domain);
-  url.searchParams.set('type', type);
+  const onlineSorted = [...availableUpstreams].sort((a, b) => (a.responseTime || 9999) - (b.responseTime || 9999));
+  if (onlineSorted.length > 0) {
+    const upstream = onlineSorted[currentUpstreamIndex % onlineSorted.length];
+    currentUpstreamIndex++;
+    return upstream;
+  }
 
-  const acceptHeaders = ['application/dns-json', 'application/json', ''];
-  let lastError = null;
+  return upstreams[0];
+}
 
-  for (const accept of acceptHeaders) {
-    try {
-      const headers = {};
-      if (accept) headers['Accept'] = accept;
-      const resp = await fetch(url.toString(), { headers });
-      if (!resp.ok) {
-        const text = await resp.text();
-        lastError = new Error(`HTTP ${resp.status}: ${text.slice(0, 100)}`);
-        continue;
-      }
-      const contentType = resp.headers.get('content-type') || '';
-      if (contentType.includes('json')) {
-        return await resp.json();
-      } else {
-        const text = await resp.text();
-        try { return JSON.parse(text); } catch (_) { throw new Error('响应不是 JSON'); }
-      }
-    } catch (e) {
-      lastError = e;
+// ============ 核心查询函数 ============
+async function queryDoH(server, domain, type, timeout = 10000) {
+  const url = new URL(server);
+  url.searchParams.set("name", domain);
+  url.searchParams.set("type", type);
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeout);
+
+  try {
+    const response = await fetch(url.toString(), {
+      headers: { 'Accept': 'application/dns-json' },
+      signal: controller.signal
+    });
+    clearTimeout(timeoutId);
+
+    if (response.ok) {
+      const data = await response.json();
+      return { success: true, data };
+    } else {
+      return { success: false, data: null };
+    }
+  } catch (err) {
+    clearTimeout(timeoutId);
+    throw err;
+  }
+}
+
+async function queryDNS(upstream, domain, type) {
+  const result = await queryDoH(upstream.server, domain, type, upstream.timeout);
+  if (result.success && result.data) {
+    return { success: true, data: result.data };
+  }
+  return { success: false, data: null };
+}
+
+async function queryWithFallback(domain, type, retryCount = 0) {
+  const maxRetries = upstreams.length;
+  const upstream = getCurrentUpstream();
+
+  try {
+    const result = await queryDNS(upstream, domain, type);
+    if (result.success && result.data && (result.data.Answer?.length > 0)) {
+      return { success: true, data: result.data, upstream: upstream.displayName };
+    }
+  } catch (err) {
+    console.log(`${upstream.displayName} 查询失败: ${err.message}`);
+  }
+
+  if (retryCount < maxRetries) {
+    return queryWithFallback(domain, type, retryCount + 1);
+  }
+
+  return { success: false, data: null, upstream: null };
+}
+
+async function queryAllTypes(domain) {
+  const types = ['A', 'AAAA', 'MX', 'TXT', 'NS', 'CNAME'];
+  const results = {};
+
+  for (const type of types) {
+    const result = await queryWithFallback(domain, type);
+    if (result.success && result.data) {
+      results[type] = result.data.Answer || [];
+      if (!results.upstream) results.upstream = result.upstream;
+    } else {
+      results[type] = [];
     }
   }
-  throw lastError || new Error('所有 DoH 尝试均失败');
+
+  return results;
 }
 
-// 查询 A、AAAA、NS 并合并结果
-async function queryMultipleTypes(dohUrl, domain) {
-  const [ipv4Result, ipv6Result, nsResult] = await Promise.all([
-    queryDns(dohUrl, domain, 'A'),
-    queryDns(dohUrl, domain, 'AAAA'),
-    queryDns(dohUrl, domain, 'NS')
-  ]);
-
-  const nsRecords = [];
-  if (nsResult.Answer) {
-    nsRecords.push(...nsResult.Answer.filter(r => r.type === 2));
-  }
-  if (nsResult.Authority) {
-    nsRecords.push(...nsResult.Authority.filter(r => r.type === 2 || r.type === 6));
-  }
-
-  const question = [];
-  [ipv4Result, ipv6Result, nsResult].forEach(res => {
-    if (res.Question) {
-      if (Array.isArray(res.Question)) question.push(...res.Question);
-      else question.push(res.Question);
-    }
-  });
-
+function getCurrentStatus() {
   return {
-    Status: ipv4Result.Status || ipv6Result.Status || nsResult.Status,
-    TC: ipv4Result.TC || ipv6Result.TC || nsResult.TC,
-    RD: ipv4Result.RD || ipv6Result.RD || nsResult.RD,
-    RA: ipv4Result.RA || ipv6Result.RA || nsResult.RA,
-    AD: ipv4Result.AD || ipv6Result.AD || nsResult.AD,
-    CD: ipv4Result.CD || ipv6Result.CD || nsResult.CD,
-    Question: question,
-    Answer: [
-      ...(ipv4Result.Answer || []),
-      ...(ipv6Result.Answer || []),
-      ...nsRecords
-    ],
-    ipv4: { records: ipv4Result.Answer || [] },
-    ipv6: { records: ipv6Result.Answer || [] },
-    ns: { records: nsRecords }
+    upstreams: upstreams.map(u => ({
+      id: u.id,
+      name: u.name,
+      displayName: u.displayName,
+      region: u.region,
+      type: u.type,
+      status: u.status,
+      responseTime: u.responseTime,
+      lastCheck: u.lastCheck,
+      selected: selectedUpstreamId === u.id
+    })),
+    mode: selectedUpstreamId === null ? 'auto' : 'manual',
+    selectedId: selectedUpstreamId,
+    currentUpstream: getCurrentUpstream().displayName,
+    availableCount: availableUpstreams.length,
+    totalCount: upstreams.length
   };
 }
 
-// ==================== 实时选择最快上游 ====================
-
-// 并发请求所有启用的上游，返回最快响应的那个（或 null）
-async function selectFastestUpstream(env, config, domain, type = 'A') {
-  const enabled = config.upstreams.filter(u => u.enabled);
-  if (enabled.length === 0) return null;
-
-  // 构造每个上游的请求，但只请求状态码和响应时间
-  const fetchPromises = enabled.map(async (upstream) => {
-    const start = Date.now();
-    try {
-      const url = new URL(upstream.url);
-      url.searchParams.set('name', domain || 'google.com'); // 若未指定查询域名，用 google.com 测试
-      url.searchParams.set('type', type);
-      const resp = await fetch(url.toString(), {
-        headers: { 'Accept': 'application/dns-json' },
-        signal: AbortSignal.timeout(ENV_DEFAULTS.FASTEST_TIMEOUT)
-      });
-      const elapsed = Date.now() - start;
-      if (!resp.ok) {
-        return { id: upstream.id, alive: false, latency: Infinity };
-      }
-      // 快速检查是否为 JSON（不解析）
-      const contentType = resp.headers.get('content-type') || '';
-      if (!contentType.includes('json')) {
-        // 可能不是 JSON，但有些服务器返回 text/plain 但内容仍是 JSON，我们尝试读取一小部分判断
-        // 为简化，我们默认接受任何 200 响应
-      }
-      return { id: upstream.id, alive: true, latency: elapsed };
-    } catch (err) {
-      return { id: upstream.id, alive: false, latency: Infinity };
-    }
-  });
-
-  const results = await Promise.all(fetchPromises);
-  // 筛选出存活的，按延迟升序
-  const alive = results.filter(r => r.alive).sort((a, b) => a.latency - b.latency);
-  if (alive.length === 0) return null;
-  // 返回对应的 upstream 对象
-  const fastestId = alive[0].id;
-  return config.upstreams.find(u => u.id === fastestId);
+// ============ 辅助函数 ============
+function formatDNSResponse(data, domain, type) {
+  if (data.Status !== undefined || data.Status === 0) {
+    return data;
+  }
+  const typeNum = recordTypeMap[type] || 1;
+  return {
+    Status: 0,
+    TC: false,
+    RD: true,
+    RA: true,
+    AD: false,
+    CD: false,
+    Question: [{ name: domain, type: typeNum, class: 1 }],
+    Answer: data.Answer || []
+  };
 }
 
-// ==================== 管理 API 处理器 ====================
-async function handleAdminAPI(request, env, url) {
-  const auth = await requireAdmin(env, request);
-  if (auth) return auth;
+function setJsonHeaders(res) {
+  res.set('Content-Type', 'application/json');
+  res.set('Content-Disposition', 'inline');
+  res.set('Cache-Control', 'no-cache, no-store, must-revalidate');
+  res.set('Pragma', 'no-cache');
+  res.set('Expires', '0');
+}
 
-  const path = url.pathname.replace('/api/admin/', '');
-  const method = request.method;
-  const config = await getConfig(env);
+// ============ 中间件 ============
+app.use(express.json({ type: 'application/dns-json' }));
+app.use(express.urlencoded({ extended: true }));
+app.use(express.raw({ type: 'application/dns-message', limit: '10mb' }));
 
-  try {
-    // GET /upstreams
-    if (path === 'upstreams' && method === 'GET') {
-      return json(config.upstreams);
-    }
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept, Authorization');
+  if (req.method === 'OPTIONS') {
+    return res.sendStatus(200);
+  }
+  next();
+});
 
-    // POST /upstreams
-    if (path === 'upstreams' && method === 'POST') {
-      const body = await request.json();
-      if (!body.name || !body.url) return json({ error: '缺少 name 或 url' }, 400);
-      const newUpstream = {
-        id: body.id || Date.now().toString(36),
-        name: body.name,
-        url: body.url,
-        enabled: body.enabled !== undefined ? body.enabled : true,
-        region: body.region || '全球'
-      };
-      config.upstreams.push(newUpstream);
-      await saveConfig(env, config);
-      return json({ success: true, id: newUpstream.id });
-    }
-
-    // PUT /upstreams/:id
-    if (path.startsWith('upstreams/') && method === 'PUT') {
-      const id = path.split('/')[1];
-      const body = await request.json();
-      const idx = config.upstreams.findIndex(u => u.id === id);
-      if (idx === -1) return json({ error: 'Not found' }, 404);
-      config.upstreams[idx] = { ...config.upstreams[idx], ...body };
-      await saveConfig(env, config);
-      return json({ success: true });
-    }
-
-    // DELETE /upstreams/:id
-    if (path.startsWith('upstreams/') && method === 'DELETE') {
-      const id = path.split('/')[1];
-      config.upstreams = config.upstreams.filter(u => u.id !== id);
-      if (config.default === id) {
-        const first = config.upstreams.find(u => u.enabled);
-        config.default = first ? first.id : '';
-      }
-      await saveConfig(env, config);
-      return json({ success: true });
-    }
-
-    // GET /config
-    if (path === 'config' && method === 'GET') {
-      return json({
-        default: config.default,
-        allow_custom: config.allow_custom,
-        doh_path: config.doh_path,
-        enable_auto_select: config.enable_auto_select
-      });
-    }
-
-    // PUT /config
-    if (path === 'config' && method === 'PUT') {
-      const body = await request.json();
-      if (body.default !== undefined) {
-        const exists = config.upstreams.some(u => u.id === body.default && u.enabled);
-        if (!exists) return json({ error: '默认服务器不存在或已禁用' }, 400);
-        config.default = body.default;
-      }
-      if (body.allow_custom !== undefined) config.allow_custom = body.allow_custom;
-      if (body.doh_path !== undefined) {
-        if (!/^[a-zA-Z0-9\-_/]+$/.test(body.doh_path)) {
-          return json({ error: '路径格式不合法' }, 400);
-        }
-        config.doh_path = body.doh_path;
-      }
-      if (body.enable_auto_select !== undefined) {
-        config.enable_auto_select = body.enable_auto_select;
-      }
-      await saveConfig(env, config);
-      return json({ success: true });
-    }
-
-    // POST /logout
-    if (path === 'logout' && method === 'POST') {
-      await destroySession(env, request);
-      return json({ success: true });
-    }
-
-    return json({ error: 'API 不存在' }, 404);
-  } catch (e) {
-    console.error('管理 API 错误:', e);
-    return json({ error: e.message }, 500);
+// ============ 登录验证中间件 ============
+function requireAdmin(req, res, next) {
+  if (req.session && req.session.isAdmin) {
+    next();
+  } else {
+    res.redirect('/admin/login');
   }
 }
 
-// ==================== 登录处理器 ====================
-async function handleLogin(request, env) {
-  if (request.method !== 'POST') return json({ error: 'Method not allowed' }, 405);
-  const { username, password } = await request.json();
-  const expectedUser = env.ADMIN_USER || ENV_DEFAULTS.ADMIN_USER;
-  const expectedPass = env.ADMIN_PASS || ENV_DEFAULTS.ADMIN_PASS;
-  if (username === expectedUser && password === expectedPass) {
-    const sid = await createSession(env, username);
-    const response = json({ success: true });
-    response.headers.set(
-      'Set-Cookie',
-      `session_id=${sid}; Path=/; HttpOnly; Secure; SameSite=Strict; Max-Age=${ENV_DEFAULTS.SESSION_TTL}`
-    );
-    return response;
-  }
-  return json({ error: '用户名或密码错误' }, 401);
-}
-
-// ==================== 公共 API：上游列表 ====================
-async function handlePublicUpstreams(env) {
-  const config = await getConfig(env);
-  const list = config.upstreams.filter(u => u.enabled).map(u => ({
-    id: u.id,
-    name: u.name,
-    url: u.url
-  }));
-  return json(list);
-}
-
-// ==================== 管理面板 HTML（简化，移除延迟列和健康检查按钮） ====================
-function renderAdminPage() {
-  return `<!DOCTYPE html>
+// ============ 管理员路由 ============
+app.get('/admin/login', (req, res) => {
+  const html = `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>DoH 管理面板</title>
-  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+  <title>管理员登录 - DoH Server</title>
   <style>
-    body { padding: 20px; background: #f8f9fa; }
-    .container { max-width: 1000px; }
-    .card { margin-bottom: 20px; }
-    .table td { vertical-align: middle; }
-  </style>
-</head>
-<body>
-<div class="container">
-  <h1 class="mb-4">🔧 DoH 管理面板</h1>
-  <div class="card">
-    <div class="card-header d-flex justify-content-between align-items-center">
-      <span>上游 DoH 服务器</span>
-      <button class="btn btn-primary btn-sm" id="addBtn">+ 添加</button>
-    </div>
-    <div class="card-body">
-      <table class="table table-hover">
-        <thead><tr><th>名称</th><th>URL</th><th>区域</th><th>状态</th><th>操作</th></tr></thead>
-        <tbody id="upstreamsBody"></tbody>
-      </table>
-    </div>
-  </div>
-  <div class="card">
-    <div class="card-header">全局设置</div>
-    <div class="card-body">
-      <form id="configForm">
-        <div class="mb-3">
-          <label for="defaultServer" class="form-label">默认服务器（手动备用）</label>
-          <select id="defaultServer" class="form-select"></select>
-        </div>
-        <div class="mb-3 form-check">
-          <input type="checkbox" class="form-check-input" id="allowCustom">
-          <label class="form-check-label" for="allowCustom">允许用户自定义 DoH 地址</label>
-        </div>
-        <div class="mb-3 form-check">
-          <input type="checkbox" class="form-check-input" id="enableAutoSelect">
-          <label class="form-check-label" for="enableAutoSelect">启用自动选择上游（实时最快）</label>
-        </div>
-        <div class="mb-3">
-          <label for="dohPath" class="form-label">DoH 端点路径（如 dns-query）</label>
-          <input type="text" class="form-control" id="dohPath" placeholder="dns-query">
-        </div>
-        <button type="submit" class="btn btn-success">保存设置</button>
-      </form>
-    </div>
-  </div>
-  <div class="mt-3">
-    <button class="btn btn-danger" id="logoutBtn">退出登录</button>
-    <a href="/" class="btn btn-secondary">返回首页</a>
-  </div>
-</div>
-<script>
-  async function loadData() {
-    const resp = await fetch('/api/admin/upstreams');
-    const upstreams = await resp.json();
-    const tbody = document.getElementById('upstreamsBody');
-    tbody.innerHTML = '';
-    upstreams.forEach(u => {
-      const tr = document.createElement('tr');
-      tr.innerHTML = \`
-        <td>\${u.name}</td>
-        <td>\${u.url}</td>
-        <td>\${u.region || '全球'}</td>
-        <td><span class="badge bg-success">✅ 启用</span></td>
-        <td>
-          <button class="btn btn-sm btn-outline-primary edit-btn" data-id="\${u.id}">编辑</button>
-          <button class="btn btn-sm btn-outline-danger delete-btn" data-id="\${u.id}">删除</button>
-        </td>
-      \`;
-      tbody.appendChild(tr);
-    });
-    document.querySelectorAll('.edit-btn').forEach(btn => {
-      btn.addEventListener('click', () => editUpstream(btn.dataset.id));
-    });
-    document.querySelectorAll('.delete-btn').forEach(btn => {
-      btn.addEventListener('click', () => deleteUpstream(btn.dataset.id));
-    });
-
-    const configResp = await fetch('/api/admin/config');
-    const config = await configResp.json();
-    const defaultSelect = document.getElementById('defaultServer');
-    defaultSelect.innerHTML = '';
-    upstreams.forEach(u => {
-      const opt = document.createElement('option');
-      opt.value = u.id;
-      opt.textContent = u.name;
-      if (u.id === config.default) opt.selected = true;
-      defaultSelect.appendChild(opt);
-    });
-    document.getElementById('allowCustom').checked = config.allow_custom;
-    document.getElementById('enableAutoSelect').checked = config.enable_auto_select;
-    document.getElementById('dohPath').value = config.doh_path;
-  }
-
-  document.getElementById('addBtn').addEventListener('click', () => {
-    const name = prompt('请输入上游名称：');
-    if (!name) return;
-    const url = prompt('请输入 DoH URL：');
-    if (!url) return;
-    const region = prompt('请输入区域（如 全球/中国）：') || '全球';
-    fetch('/api/admin/upstreams', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name, url, region, enabled: true })
-    }).then(res => res.json()).then(data => {
-      if (data.success) loadData();
-      else alert('添加失败：' + data.error);
-    });
-  });
-
-  async function editUpstream(id) {
-    const resp = await fetch('/api/admin/upstreams');
-    const upstreams = await resp.json();
-    const u = upstreams.find(item => item.id === id);
-    if (!u) return;
-    const newName = prompt('修改名称：', u.name);
-    if (newName === null) return;
-    const newUrl = prompt('修改 URL：', u.url);
-    if (newUrl === null) return;
-    const newRegion = prompt('修改区域：', u.region || '全球');
-    if (newRegion === null) return;
-    const newEnabled = confirm('是否启用？') ? true : false;
-    fetch('/api/admin/upstreams/' + id, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name: newName, url: newUrl, region: newRegion, enabled: newEnabled })
-    }).then(res => res.json()).then(data => {
-      if (data.success) loadData();
-      else alert('更新失败：' + data.error);
-    });
-  }
-
-  function deleteUpstream(id) {
-    if (!confirm('确定要删除此上游吗？')) return;
-    fetch('/api/admin/upstreams/' + id, { method: 'DELETE' })
-      .then(res => res.json()).then(data => {
-        if (data.success) loadData();
-        else alert('删除失败：' + data.error);
-      });
-  }
-
-  document.getElementById('configForm').addEventListener('submit', async (e) => {
-    e.preventDefault();
-    const defaultServer = document.getElementById('defaultServer').value;
-    const allowCustom = document.getElementById('allowCustom').checked;
-    const enableAutoSelect = document.getElementById('enableAutoSelect').checked;
-    const dohPath = document.getElementById('dohPath').value.trim();
-    if (!dohPath) { alert('路径不能为空'); return; }
-    const resp = await fetch('/api/admin/config', {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ 
-        default: defaultServer, 
-        allow_custom: allowCustom, 
-        enable_auto_select: enableAutoSelect,
-        doh_path: dohPath 
-      })
-    });
-    const data = await resp.json();
-    if (data.success) {
-      alert('设置已保存');
-      loadData();
-    } else {
-      alert('保存失败：' + data.error);
-    }
-  });
-
-  document.getElementById('logoutBtn').addEventListener('click', async () => {
-    await fetch('/api/admin/logout', { method: 'POST' });
-    location.reload();
-  });
-
-  loadData();
-</script>
-</body>
-</html>`;
-}
-
-// ==================== 登录页面 HTML ====================
-function renderLoginPage(message = '') {
-  return `<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>管理员登录</title>
-  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
-  <style>
-    body { display: flex; justify-content: center; align-items: center; min-height: 100vh; background: #f8f9fa; }
-    .login-card { width: 100%; max-width: 400px; }
-  </style>
-</head>
-<body>
-<div class="card login-card">
-  <div class="card-body">
-    <h3 class="card-title text-center mb-4">管理员登录</h3>
-    ${message ? `<div class="alert alert-danger">${message}</div>` : ''}
-    <form id="loginForm">
-      <div class="mb-3">
-        <label for="username" class="form-label">用户名</label>
-        <input type="text" class="form-control" id="username" required>
-      </div>
-      <div class="mb-3">
-        <label for="password" class="form-label">密码</label>
-        <input type="password" class="form-control" id="password" required>
-      </div>
-      <button type="submit" class="btn btn-primary w-100">登录</button>
-    </form>
-  </div>
-</div>
-<script>
-  document.getElementById('loginForm').addEventListener('submit', async (e) => {
-    e.preventDefault();
-    const username = document.getElementById('username').value;
-    const password = document.getElementById('password').value;
-    const resp = await fetch('/api/admin/login', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ username, password })
-    });
-    const data = await resp.json();
-    if (data.success) {
-      location.href = '/admin';
-    } else {
-      alert('登录失败：' + data.error);
-    }
-  });
-</script>
-</body>
-</html>`;
-}
-
-// ==================== 公共首页（保持不变） ====================
-async function renderPublicPage(env) {
-  const config = await getConfig(env);
-  const dohPath = config.doh_path || 'dns-query';
-  const autoSelect = config.enable_auto_select ? true : false;
-  let fixedUpstreamName = '未配置';
-  if (!autoSelect) {
-    const defaultUpstream = config.upstreams.find(u => u.id === config.default && u.enabled);
-    if (defaultUpstream) fixedUpstreamName = defaultUpstream.name;
-  }
-  const hostname = new URL(env.URL || 'https://example.com').hostname || '...';
-
-  return new Response(`<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>DNS-over-HTTPS Resolver</title>
-  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css">
-  <link rel="icon" href="https://cf-assets.www.cloudflare.com/dzlvafdwdttg/6TaQ8Q7BDmdAFRoHpDCb82/8d9bc52a2ac5af100de3a9adcf99ffaa/security-shield-protection-2.svg" type="image/x-icon">
-  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
     body {
-      font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif;
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
       min-height: 100vh;
-      padding: 0;
-      margin: 0;
-      line-height: 1.6;
-      background: url('https://cf-assets.www.cloudflare.com/dzlvafdwdttg/5B5shLB8bSKIyB9NJ6R1jz/87e7617be2c61603d46003cb3f1bd382/Hero-globe-bg-takeover-xxl.png'),
-                  linear-gradient(135deg, rgba(253, 101, 60, 0.85) 0%, rgba(251,152,30, 0.85) 100%);
-      background-size: cover;
-      background-position: center center;
-      background-repeat: no-repeat;
-      background-attachment: fixed;
-      padding: 30px 20px;
-      box-sizing: border-box;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      padding: 20px;
     }
-    .container {
-      width: 100%;
-      max-width: 800px;
-      margin: 20px auto;
-      background-color: rgba(255,255,255,0.65);
+    .login-card {
+      background: white;
       border-radius: 16px;
-      box-shadow: 0 8px 32px rgba(0,0,0,0.15);
-      padding: 30px;
-      backdrop-filter: blur(10px);
-      border: 1px solid rgba(255,255,255,0.4);
+      padding: 40px;
+      width: 100%;
+      max-width: 400px;
+      box-shadow: 0 10px 30px rgba(0,0,0,0.2);
     }
-    h1 {
-      background-image: linear-gradient(to right, rgb(249,171,76), rgb(252,103,60));
-      color: rgb(252,103,60);
-      -webkit-background-clip: text;
-      background-clip: text;
-      -webkit-text-fill-color: transparent;
-      font-weight: 600;
+    .login-card h1 {
+      color: #667eea;
+      margin-bottom: 30px;
+      text-align: center;
     }
-    .card {
+    .input-group {
       margin-bottom: 20px;
-      border: none;
-      box-shadow: 0 2px 10px rgba(0,0,0,0.05);
-      background-color: rgba(255,255,255,0.8);
-      backdrop-filter: blur(5px);
     }
-    .card-header {
-      background-color: rgba(255,242,235,0.9);
-      font-weight: 600;
+    .input-group label {
+      display: block;
+      margin-bottom: 8px;
+      color: #555;
+      font-weight: 500;
+    }
+    .input-group input {
+      width: 100%;
+      padding: 12px 15px;
+      border: 2px solid #e0e0e0;
+      border-radius: 8px;
+      font-size: 16px;
+    }
+    .input-group input:focus {
+      outline: none;
+      border-color: #667eea;
+    }
+    button {
+      width: 100%;
+      padding: 12px;
+      background: #667eea;
+      color: white;
+      border: none;
+      border-radius: 8px;
+      font-size: 16px;
+      font-weight: bold;
+      cursor: pointer;
+    }
+    button:hover { background: #5a67d8; }
+    .error {
+      background: #ffebee;
+      color: #f44336;
+      padding: 10px;
+      border-radius: 8px;
+      margin-bottom: 20px;
+      text-align: center;
+    }
+    .footer {
+      text-align: center;
+      margin-top: 20px;
+      color: #999;
+      font-size: 12px;
+    }
+  </style>
+</head>
+<body>
+  <div class="login-card">
+    <h1>🔐 管理员登录</h1>
+    ${req.query.error ? '<div class="error">用户名或密码错误</div>' : ''}
+    <form method="POST" action="/admin/login">
+      <div class="input-group">
+        <label>用户名</label>
+        <input type="text" name="username" required autofocus>
+      </div>
+      <div class="input-group">
+        <label>密码</label>
+        <input type="password" name="password" required>
+      </div>
+      <button type="submit">登 录</button>
+    </form>
+    <div class="footer">DoH Server Admin Panel</div>
+  </div>
+</body>
+</html>`;
+  res.send(html);
+});
+
+app.post('/admin/login', (req, res) => {
+  const { username, password } = req.body;
+  if (username === ADMIN_USER && password === ADMIN_PASS) {
+    req.session.isAdmin = true;
+    res.redirect('/admin');
+  } else {
+    res.redirect('/admin/login?error=1');
+  }
+});
+
+app.get('/admin/logout', (req, res) => {
+  req.session.destroy();
+  res.redirect('/admin/login');
+});
+
+app.get('/admin', requireAdmin, (req, res) => {
+  const hostname = req.headers.host;
+  const protocol = req.headers['x-forwarded-proto'] || 'https';
+  const currentDohUrl = `${protocol}://${hostname}/${DoH路径}`;
+  const homeUrl = `${protocol}://${hostname}/`;
+  const logoutUrl = `${protocol}://${hostname}/admin/logout`;
+
+  const html = `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>管理员面板 - DoH Server</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif;
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      min-height: 100vh;
+      padding: 20px;
+    }
+    .container { max-width: 1200px; margin: 0 auto; }
+    .header {
       display: flex;
       justify-content: space-between;
       align-items: center;
+      color: white;
+      margin-bottom: 30px;
+      flex-wrap: wrap;
+      gap: 15px;
     }
-    .form-label {
-      font-weight: 500;
-      color: rgb(70,50,40);
+    .header h1 { font-size: 2em; }
+    .header-buttons {
+      display: flex;
+      gap: 12px;
+      align-items: center;
     }
-    .btn-primary {
-      background-color: rgb(253,101,60);
-      border: none;
-    }
-    .btn-primary:hover {
-      background-color: rgb(230,90,50);
-    }
-    pre {
-      background-color: rgba(255,245,240,0.9);
-      padding: 15px;
-      border-radius: 6px;
-      border: 1px solid rgba(253,101,60,0.2);
-      white-space: pre-wrap;
-      word-break: break-all;
-      max-height: 400px;
-      overflow: auto;
-    }
-    .loading {
-      display: none;
-      text-align: center;
-      padding: 20px 0;
-    }
-    .loading-spinner {
-      border: 4px solid rgba(0,0,0,0.1);
-      border-left: 4px solid rgb(253,101,60);
-      border-radius: 50%;
-      width: 30px;
-      height: 30px;
-      animation: spin 1s linear infinite;
-      margin: 0 auto 10px;
-    }
-    @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
-    .badge { margin-left: 5px; }
-    .ip-record {
-      padding: 5px 10px;
-      margin-bottom: 5px;
-      border-radius: 4px;
-      background-color: rgba(255,255,255,0.9);
-      border: 1px solid rgba(253,101,60,0.15);
-    }
-    .ip-record:hover { background-color: rgba(255,235,225,0.9); }
-    .ip-address {
-      font-family: monospace;
-      font-weight: 600;
-      cursor: pointer;
-    }
-    .ip-address.copied:after { content: '✓ 已复制'; opacity: 1; }
-    .geo-blocked {
-      color: #fff;
-      background-color: #dc3545;
-      padding: 2px 8px;
-      border-radius: 4px;
-      font-weight: 600;
-      animation: pulse-red 2s infinite;
-    }
-    @keyframes pulse-red {
-      0% { box-shadow: 0 0 0 0 rgba(220,53,69,0.7); }
-      70% { box-shadow: 0 0 0 10px rgba(220,53,69,0); }
-      100% { box-shadow: 0 0 0 0 rgba(220,53,69,0); }
-    }
-    .geo-loading { color: rgb(150,100,80); font-style: italic; }
-    .ttl-info { min-width: 80px; text-align: right; color: rgb(180,90,60); }
-    .copy-link {
-      color: rgb(253,101,60);
+    .home-btn {
+      background: rgba(255,255,255,0.2);
+      border: 1px solid rgba(255,255,255,0.3);
+      padding: 8px 16px;
+      border-radius: 8px;
+      color: white;
       text-decoration: none;
-      border-bottom: 1px dashed rgb(253,101,60);
+      transition: all 0.3s ease;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .home-btn:hover {
+      background: rgba(255,255,255,0.3);
+      transform: translateY(-2px);
+    }
+    .logout-btn {
+      background: rgba(220, 53, 69, 0.8);
+      border: 1px solid rgba(220, 53, 69, 1);
+      padding: 8px 16px;
+      border-radius: 8px;
+      color: white;
+      text-decoration: none;
+      transition: all 0.3s ease;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .logout-btn:hover {
+      background: rgba(220, 53, 69, 1);
+      transform: translateY(-2px);
+    }
+    .card {
+      background: white;
+      border-radius: 16px;
+      padding: 25px;
+      margin-bottom: 20px;
+      box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+    }
+    .card h2 {
+      color: #667eea;
+      margin-bottom: 20px;
+      border-bottom: 2px solid #e0e0e0;
+      padding-bottom: 10px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 10px;
+    }
+    .endpoint {
+      background: #f5f5f5;
+      padding: 12px 15px;
+      border-radius: 8px;
+      font-family: monospace;
+      word-break: break-all;
+    }
+    .upstream-table {
+      width: 100%;
+      border-collapse: collapse;
+    }
+    .upstream-table th, .upstream-table td {
+      padding: 10px;
+      text-align: left;
+      border-bottom: 1px solid #eee;
+    }
+    .upstream-table th {
+      background: #f8f9fa;
+      font-weight: 600;
+    }
+    .status-online { color: #4caf50; font-weight: bold; }
+    .status-offline { color: #f44336; font-weight: bold; }
+    .status-checking { color: #ff9800; }
+    .switch-btn {
+      padding: 4px 12px;
+      border: none;
+      border-radius: 6px;
       cursor: pointer;
+      font-size: 12px;
+      background: #667eea;
+      color: white;
     }
-    .copy-link.copied:after { content: '✓ 已复制'; opacity: 1; }
-    .github-corner svg {
-      fill: #fff;
-      color: rgb(251,152,30);
-      position: absolute;
-      top: 0;
-      right: 0;
-      border: 0;
-      width: 80px;
-      height: 80px;
-    }
-    .github-corner:hover .octo-arm {
-      animation: octocat-wave 560ms ease-in-out;
-    }
-    @keyframes octocat-wave {
-      0%,100%{transform:rotate(0)}20%,60%{transform:rotate(-25deg)}40%,80%{transform:rotate(10deg)}
-    }
-    @media (max-width:576px){ .github-corner .octo-arm{animation:octocat-wave 560ms ease-in-out} }
-    .info-line {
+    .switch-btn:hover { background: #5a67d8; }
+    .switch-btn:disabled { background: #ccc; cursor: not-allowed; }
+    .auto-btn {
+      background: #4caf50;
+      padding: 8px 16px;
+      border: none;
+      border-radius: 6px;
+      cursor: pointer;
       font-size: 14px;
-      color: #6c757d;
-      text-align: center;
-      margin-top: 10px;
+      color: white;
     }
-    .admin-link .btn {
-      font-size: 0.9rem;
+    .auto-btn:hover { background: #45a049; }
+    .refresh-btn {
+      background: #667eea;
+      color: white;
+      border: none;
+      padding: 5px 12px;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 12px;
+    }
+    .refresh-btn:hover { background: #5a67d8; }
+    .current-info {
+      background: #e8f4f8;
+      padding: 10px 15px;
+      border-radius: 8px;
+      margin-bottom: 15px;
+    }
+    .footer { text-align: center; color: white; margin-top: 30px; opacity: 0.8; }
+    @media (max-width: 768px) {
+      .upstream-table { font-size: 12px; }
+      .upstream-table th, .upstream-table td { padding: 6px; }
+      .header { flex-direction: column; text-align: center; }
+      .header-buttons { justify-content: center; }
     }
   </style>
 </head>
 <body>
-<a href="https://github.com/cmliu/CF-Workers-DoH" target="_blank" class="github-corner" aria-label="View source on Github">
-  <svg viewBox="0 0 250 250" aria-hidden="true"><path d="M0,0 L115,115 L130,115 L142,142 L250,250 L250,0 Z"></path><path d="M128.3,109.0 C113.8,99.7 119.0,89.6 119.0,89.6 C122.0,82.7 120.5,78.6 120.5,78.6 C119.2,72.0 123.4,76.3 123.4,76.3 C127.3,80.9 125.5,87.3 125.5,87.3 C122.9,97.6 130.6,101.9 134.4,103.2" fill="currentColor" style="transform-origin: 130px 106px;" class="octo-arm"></path><path d="M115.0,115.0 C114.9,115.1 118.7,116.5 119.8,115.4 L133.7,101.6 C136.9,99.2 139.9,98.4 142.2,98.6 C133.8,88.0 127.5,74.4 143.8,58.0 C148.5,53.4 154.0,51.2 159.7,51.0 C160.3,49.4 163.2,43.6 171.4,40.1 C171.4,40.1 176.1,42.5 178.8,56.2 C183.1,58.6 187.2,61.8 190.9,65.4 C194.5,69.0 197.7,73.2 200.1,77.6 C213.8,80.2 216.3,84.9 216.3,84.9 C212.7,93.1 206.9,96.0 205.4,96.6 C205.1,102.4 203.0,107.8 198.3,112.5 C181.9,128.9 168.3,122.5 157.7,114.1 C157.9,116.9 156.7,120.9 152.7,124.9 L141.0,136.5 C139.8,137.7 141.6,141.9 141.8,141.8 Z" fill="currentColor" class="octo-body"></path></svg>
-</a>
-<div class="container">
-  <h1 class="text-center mb-4">DNS-over-HTTPS Resolver</h1>
-  <div class="card">
-    <div class="card-header">
-      <span>DNS 查询</span>
-      <span class="admin-link">
-        <a href="/admin" target="_blank" class="btn btn-sm btn-outline-secondary">管理员登录</a>
-      </span>
+  <div class="container">
+    <div class="header">
+      <h1>🔧 管理员面板</h1>
+      <div class="header-buttons">
+        <a href="${homeUrl}" class="home-btn">
+          🏠 返回前台
+        </a>
+        <a href="${logoutUrl}" class="logout-btn" onclick="return confirm('确定要退出登录吗？')">
+          🚪 退出登录
+        </a>
+      </div>
     </div>
-    <div class="card-body">
-      <form id="resolveForm">
-        <div class="mb-3">
-          <label for="domain" class="form-label">待解析域名:</label>
-          <div class="input-group">
-            <input type="text" id="domain" class="form-control" value="www.google.com" placeholder="输入域名，如 example.com">
-            <button type="button" class="btn btn-outline-secondary" id="clearBtn">清除</button>
-          </div>
-        </div>
-        <div class="d-flex gap-2">
-          <button type="submit" class="btn btn-primary flex-grow-1">解析</button>
-          <button type="button" class="btn btn-outline-primary" id="getJsonBtn">Get Json</button>
-        </div>
-      </form>
+
+    <div class="card">
+      <h2>📊 服务状态</h2>
+      <p><strong>🔗 DoH 端点：</strong></p>
+      <div class="endpoint" id="endpoint"></div>
+      <div class="current-info" id="currentInfo"></div>
+    </div>
+
+    <div class="card">
+      <h2>
+        🌐 上游 DNS 服务器
+        <button class="refresh-btn" onclick="refreshHealthCheck()">🔄 刷新健康检查</button>
+      </h2>
+      <div style="overflow-x: auto;">
+        <table class="upstream-table">
+          <thead>
+            <tr><th>状态</th><th>上游服务器</th><th>区域</th><th>响应时间</th><th>操作</th></tr>
+          </thead>
+          <tbody id="upstreamList"></tbody>
+        </table>
+      </div>
+      <div style="margin-top: 15px; text-align: center;">
+        <button class="auto-btn" onclick="setAutoMode()">🔄 切换到自动模式</button>
+      </div>
+    </div>
+
+    <div class="footer">
+      <p>管理员面板 - 只有管理员可以切换上游 DNS</p>
     </div>
   </div>
 
-  <div class="card">
-    <div class="card-header d-flex justify-content-between align-items-center">
-      <span>解析结果</span>
-      <button class="btn btn-sm btn-outline-secondary" id="copyBtn" style="display: none;">复制结果</button>
+  <script>
+    const endpoint = '${currentDohUrl}';
+    document.getElementById('endpoint').innerHTML = endpoint;
+
+    let currentMode = 'auto';
+    let currentSelectedId = null;
+
+    async function loadUpstreams() {
+      try {
+        const response = await fetch('/api/upstreams');
+        const data = await response.json();
+        currentMode = data.mode;
+        currentSelectedId = data.selectedId;
+        renderUpstreams(data.upstreams, data.mode, data.selectedId);
+        updateCurrentInfo(data.currentUpstream, data.mode);
+      } catch (err) {
+        console.error('加载失败:', err);
+        setTimeout(loadUpstreams, 3000);
+      }
+    }
+
+    function renderUpstreams(upstreams, mode, selectedId) {
+      const tbody = document.getElementById('upstreamList');
+      if (!tbody) return;
+      tbody.innerHTML = '';
+
+      const sorted = [...upstreams].sort((a, b) => {
+        if (a.status === 'online' && b.status !== 'online') return -1;
+        if (a.status !== 'online' && b.status === 'online') return 1;
+        if (a.status === 'online' && b.status === 'online') {
+          return (a.responseTime || 9999) - (b.responseTime || 9999);
+        }
+        return 0;
+      });
+
+      sorted.forEach(u => {
+        const row = tbody.insertRow();
+
+        const statusCell = row.insertCell(0);
+        let statusText = '', statusClass = '';
+        switch(u.status) {
+          case 'online': statusText = '● 在线'; statusClass = 'status-online'; break;
+          case 'offline': statusText = '○ 离线'; statusClass = 'status-offline'; break;
+          default: statusText = '◐ 检测中'; statusClass = 'status-checking';
+        }
+        statusCell.innerHTML = '<span class="' + statusClass + '">' + statusText + '</span>';
+
+        const nameCell = row.insertCell(1);
+        let nameHtml = u.displayName;
+        if (mode === 'manual' && selectedId !== null && u.id === selectedId) {
+          nameHtml += ' <span style="background:#ff9800; color:white; padding:2px 8px; border-radius:4px; font-size:10px;">当前使用</span>';
+        }
+        nameCell.innerHTML = nameHtml;
+
+        const regionCell = row.insertCell(2);
+        regionCell.innerHTML = u.region || '全球';
+
+        const timeCell = row.insertCell(3);
+        timeCell.innerHTML = u.responseTime ? u.responseTime + 'ms' : '-';
+
+        const actionCell = row.insertCell(4);
+        if (u.status === 'online') {
+          const switchBtn = document.createElement('button');
+          if (mode === 'manual' && selectedId !== null && u.id === selectedId) {
+            switchBtn.textContent = '当前使用';
+            switchBtn.disabled = true;
+            switchBtn.style.background = '#ccc';
+            switchBtn.style.cursor = 'default';
+          } else {
+            switchBtn.textContent = '切换到此';
+            switchBtn.className = 'switch-btn';
+            switchBtn.onclick = (function(id) {
+              return function() { switchUpstream(id); };
+            })(u.id);
+          }
+          actionCell.appendChild(switchBtn);
+        } else {
+          actionCell.innerHTML = '<span style="color:#999;">不可用</span>';
+        }
+      });
+    }
+
+    function updateCurrentInfo(upstream, mode) {
+      const infoDiv = document.getElementById('currentInfo');
+      if (!infoDiv) return;
+      const modeText = mode === 'auto' ? '自动切换' : '手动固定';
+      infoDiv.innerHTML = '📡 当前使用: <strong>' + upstream + '</strong> <span style="background:' + (mode === 'auto' ? '#4caf50' : '#ff9800') + '; color:white; padding:2px 8px; border-radius:4px; font-size:12px; margin-left:10px;">' + modeText + '</span>';
+    }
+
+    async function switchUpstream(id) {
+      try {
+        const response = await fetch('/api/switch/' + id, { method: 'POST' });
+        const data = await response.json();
+        if (data.success) {
+          console.log('已切换到:', data.upstream);
+          await loadUpstreams();
+        } else {
+          alert('切换失败: ' + data.message);
+        }
+      } catch (err) {
+        console.error('切换失败:', err);
+        alert('切换失败: ' + err.message);
+      }
+    }
+
+    async function setAutoMode() {
+      try {
+        const response = await fetch('/api/auto', { method: 'POST' });
+        const data = await response.json();
+        if (data.success) {
+          console.log('已切换到自动模式');
+          await loadUpstreams();
+        }
+      } catch (err) {
+        console.error('切换失败:', err);
+      }
+    }
+
+    async function refreshHealthCheck() {
+      const btn = event.target;
+      const originalText = btn.textContent;
+      btn.textContent = '检查中...';
+      btn.disabled = true;
+      try {
+        await fetch('/api/healthcheck', { method: 'POST' });
+        setTimeout(async function() {
+          await loadUpstreams();
+          btn.textContent = originalText;
+          btn.disabled = false;
+        }, 3000);
+      } catch (err) {
+        console.error('刷新失败:', err);
+        btn.textContent = originalText;
+        btn.disabled = false;
+      }
+    }
+
+    loadUpstreams();
+    setInterval(loadUpstreams, 10000);
+  </script>
+</body>
+</html>`;
+  res.send(html);
+});
+
+// ============ API 路由 ============
+app.post('/api/switch/:id', requireAdmin, (req, res) => {
+  const id = parseInt(req.params.id);
+  const upstream = upstreams.find(u => u.id === id);
+
+  if (upstream && upstream.status === 'online') {
+    selectedUpstreamId = id;
+    currentUpstreamIndex = 0;
+    console.log(`🔧 手动切换到: ${upstream.displayName}`);
+    res.json({ success: true, upstream: upstream.displayName });
+  } else {
+    res.json({ success: false, message: '上游不可用' });
+  }
+});
+
+app.post('/api/auto', requireAdmin, (req, res) => {
+  selectedUpstreamId = null;
+  currentUpstreamIndex = 0;
+  console.log(`🔧 切换到自动模式`);
+  res.json({ success: true, mode: 'auto' });
+});
+
+app.post('/api/healthcheck', requireAdmin, async (req, res) => {
+  await healthCheck();
+  res.json({ success: true });
+});
+
+app.get('/api/upstreams', (req, res) => {
+  res.json(getCurrentStatus());
+});
+
+app.get('/api/dns', async (req, res) => {
+  const domain = req.query.domain || 'www.google.com';
+  const type = req.query.type || 'A';
+
+  try {
+    if (type === 'all') {
+      const results = await queryAllTypes(domain);
+      const formatted = {
+        Status: 0,
+        upstream: results.upstream || 'auto',
+        ...results
+      };
+      setJsonHeaders(res);
+      return res.json(formatted);
+    } else {
+      const result = await queryWithFallback(domain, type);
+      if (result.success) {
+        const formatted = formatDNSResponse(result.data, domain, type);
+        setJsonHeaders(res);
+        return res.json({
+          Status: formatted.Status,
+          upstream: result.upstream,
+          ...formatted
+        });
+      } else {
+        setJsonHeaders(res);
+        return res.status(404).json({
+          Status: 2,
+          upstream: null,
+          Answer: [],
+          error: '查询失败'
+        });
+      }
+    }
+  } catch (err) {
+    setJsonHeaders(res);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ============ DoH 端点 ============
+app.all(`/${DoH路径}`, async (req, res) => {
+  const { method, headers, body } = req;
+  const UA = headers['user-agent'] || 'DoH Client';
+  const accept = headers['accept'] || '';
+  const contentType = headers['content-type'] || '';
+
+  try {
+    const upstream = getCurrentUpstream();
+    let domain = null;
+    let type = 'A';
+    let response = null;
+
+    async function tryMultipleDoHEndpoints(endpoints, requestUrl, options) {
+      let lastError = null;
+      for (const endpoint of endpoints) {
+        try {
+          const fullUrl = requestUrl ? `${endpoint}${requestUrl}` : endpoint;
+          const resp = await fetch(fullUrl, options);
+          if (resp.ok) return resp;
+          lastError = new Error(`HTTP ${resp.status}`);
+        } catch (err) {
+          lastError = err;
+        }
+      }
+      throw lastError || new Error('所有 DoH 端点均失败');
+    }
+
+    if (method === 'GET') {
+      const url = new URL(req.url, `http://${req.headers.host}`);
+
+      if (url.searchParams.has('name')) {
+        domain = url.searchParams.get('name');
+        type = url.searchParams.get('type') || 'A';
+
+        if (accept.includes('application/dns-message')) {
+          const endpoints = upstreams.filter(u => u.status === 'online').map(u => u.server);
+          if (endpoints.length === 0) endpoints.push(upstream.server);
+          const queryString = `?name=${encodeURIComponent(domain)}&type=${encodeURIComponent(type)}`;
+          const wireResponse = await tryMultipleDoHEndpoints(
+            endpoints,
+            queryString,
+            { headers: { 'Accept': 'application/dns-message', 'User-Agent': UA } }
+          );
+          const arrayBuffer = await wireResponse.arrayBuffer();
+          const wireBody = Buffer.from(arrayBuffer);
+          res.set('Content-Type', 'application/dns-message');
+          res.set('Content-Length', wireBody.length);
+          res.set('Access-Control-Allow-Origin', '*');
+          return res.status(wireResponse.status).send(wireBody);
+        }
+
+        const result = await queryDNS(upstream, domain, type);
+        if (result.success && result.data) {
+          const formatted = formatDNSResponse(result.data, domain, type);
+          setJsonHeaders(res);
+          return res.json(formatted);
+        } else {
+          setJsonHeaders(res);
+          return res.status(500).json({
+            Status: 2,
+            Answer: [],
+            error: 'DNS 查询失败',
+            code: 'QUERY_FAILED'
+          });
+        }
+      }
+
+      if (url.searchParams.has('dns')) {
+        const endpoints = upstreams.filter(u => u.status === 'online').map(u => u.server);
+        if (endpoints.length === 0) endpoints.push(upstream.server);
+        const base64url = url.searchParams.get('dns');
+        const queryString = `?dns=${encodeURIComponent(base64url)}`;
+        const wireResponse = await tryMultipleDoHEndpoints(
+          endpoints,
+          queryString,
+          { headers: { 'Accept': 'application/dns-message', 'User-Agent': UA } }
+        );
+        const arrayBuffer = await wireResponse.arrayBuffer();
+        const wireBody = Buffer.from(arrayBuffer);
+        res.set('Content-Type', 'application/dns-message');
+        res.set('Content-Length', wireBody.length);
+        res.set('Access-Control-Allow-Origin', '*');
+        return res.status(wireResponse.status).send(wireBody);
+      }
+
+      setJsonHeaders(res);
+      return res.status(400).json({ error: '缺少参数 name 或 dns' });
+    }
+
+    else if (method === 'POST') {
+      let rawBody = '';
+      if (Buffer.isBuffer(body)) {
+        rawBody = body.toString('utf8');
+      } else if (typeof body === 'string') {
+        rawBody = body;
+      } else if (body && typeof body === 'object') {
+        rawBody = JSON.stringify(body);
+      }
+
+      if (contentType.includes('application/dns-json')) {
+        try {
+          let jsonBody;
+          if (typeof body === 'object' && body !== null && !Buffer.isBuffer(body)) {
+            jsonBody = body;
+          } else {
+            jsonBody = JSON.parse(rawBody);
+          }
+          domain = jsonBody.name || jsonBody.domain;
+          type = jsonBody.type || 'A';
+        } catch (e) {
+          setJsonHeaders(res);
+          return res.status(400).json({ error: '无效的 JSON 格式', message: e.message });
+        }
+      } else if (contentType.includes('application/x-www-form-urlencoded')) {
+        try {
+          if (req.body && typeof req.body === 'object' && Object.keys(req.body).length > 0) {
+            domain = req.body.name || req.body.domain;
+            type = req.body.type || 'A';
+          } else if (rawBody) {
+            const params = new URLSearchParams(rawBody);
+            domain = params.get('name') || params.get('domain');
+            type = params.get('type') || 'A';
+          }
+        } catch (e) {
+          setJsonHeaders(res);
+          return res.status(400).json({ error: '无效的表单格式' });
+        }
+      } else if (contentType.includes('application/dns-message')) {
+        const endpoints = upstreams.filter(u => u.status === 'online').map(u => u.server);
+        if (endpoints.length === 0) endpoints.push(upstream.server);
+        const options = {
+          method: 'POST',
+          headers: {
+            'Accept': 'application/dns-message',
+            'Content-Type': 'application/dns-message',
+            'User-Agent': UA
+          },
+          body: body
+        };
+        let lastError = null;
+        for (const endpoint of endpoints) {
+          try {
+            const resp = await fetch(endpoint, options);
+            if (resp.ok) {
+              response = resp;
+              break;
+            }
+            lastError = new Error(`HTTP ${resp.status}`);
+          } catch (err) {
+            lastError = err;
+          }
+        }
+        if (!response) {
+          throw lastError || new Error('所有 DoH POST 失败');
+        }
+      } else if (rawBody.trim().startsWith('{')) {
+        try {
+          const jsonBody = JSON.parse(rawBody);
+          domain = jsonBody.name || jsonBody.domain;
+          type = jsonBody.type || 'A';
+        } catch (e) {
+          setJsonHeaders(res);
+          return res.status(400).json({ error: '无法解析 JSON 请求体' });
+        }
+      } else if (rawBody.includes('=')) {
+        try {
+          const params = new URLSearchParams(rawBody);
+          domain = params.get('name') || params.get('domain');
+          type = params.get('type') || 'A';
+        } catch (e) {
+          setJsonHeaders(res);
+          return res.status(400).json({ error: '无法解析表单请求体' });
+        }
+      }
+
+      if (domain && !response) {
+        if (accept.includes('application/dns-message')) {
+          const endpoints = upstreams.filter(u => u.status === 'online').map(u => u.server);
+          if (endpoints.length === 0) endpoints.push(upstream.server);
+          const queryString = `?name=${encodeURIComponent(domain)}&type=${encodeURIComponent(type)}`;
+          const wireResponse = await tryMultipleDoHEndpoints(
+            endpoints,
+            queryString,
+            { headers: { 'Accept': 'application/dns-message', 'User-Agent': UA } }
+          );
+          const arrayBuffer = await wireResponse.arrayBuffer();
+          const wireBody = Buffer.from(arrayBuffer);
+          res.set('Content-Type', 'application/dns-message');
+          res.set('Content-Length', wireBody.length);
+          res.set('Access-Control-Allow-Origin', '*');
+          return res.status(wireResponse.status).send(wireBody);
+        }
+
+        const result = await queryDNS(upstream, domain, type);
+        if (result.success && result.data) {
+          const formatted = formatDNSResponse(result.data, domain, type);
+          setJsonHeaders(res);
+          return res.json(formatted);
+        } else {
+          setJsonHeaders(res);
+          return res.status(500).json({
+            Status: 2,
+            Answer: [],
+            error: 'DNS 查询失败',
+            code: 'QUERY_FAILED'
+          });
+        }
+      }
+
+      if (!domain && !response) {
+        setJsonHeaders(res);
+        return res.status(400).json({
+          error: '无法解析请求',
+          message: '请确保请求包含 name 或 domain 参数',
+          contentType: contentType
+        });
+      }
+    }
+
+    if (response) {
+      if (!response.ok) throw new Error(`DoH 返回错误 (${response.status})`);
+      const arrayBuffer = await response.arrayBuffer();
+      const responseBody = Buffer.from(arrayBuffer);
+      res.set('Content-Type', 'application/dns-message');
+      res.set('Content-Length', responseBody.length);
+      res.set('Access-Control-Allow-Origin', '*');
+      return res.status(response.status).send(responseBody);
+    }
+
+    setJsonHeaders(res);
+    return res.status(400).json({ error: '不支持的请求格式' });
+
+  } catch (error) {
+    console.error("DoH 请求处理错误:", error);
+    setJsonHeaders(res);
+    res.status(500).json({ error: '内部服务器错误', message: error.message, code: 'INTERNAL_ERROR' });
+  }
+});
+
+// ============ 公开首页 ============
+app.get('/', (req, res) => {
+  const hostname = req.headers.host;
+  const protocol = req.headers['x-forwarded-proto'] || 'https';
+  const currentDohUrl = `${protocol}://${hostname}/${DoH路径}`;
+  const adminUrl = `${protocol}://${hostname}/admin`;
+
+  const html = `<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>DNS-over-HTTPS Server</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif;
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      min-height: 100vh;
+      padding: 20px;
+    }
+    .container { max-width: 1000px; margin: 0 auto; }
+    .header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      color: white;
+      margin-bottom: 30px;
+      flex-wrap: wrap;
+      gap: 15px;
+    }
+    .header h1 { font-size: 2.5em; }
+    .header-sub { text-align: right; }
+    .login-btn {
+      background: rgba(255,255,255,0.2);
+      border: 1px solid rgba(255,255,255,0.3);
+      padding: 10px 24px;
+      border-radius: 30px;
+      color: white;
+      text-decoration: none;
+      font-size: 14px;
+      font-weight: 500;
+      transition: all 0.3s ease;
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .login-btn:hover {
+      background: rgba(255,255,255,0.3);
+      transform: translateY(-2px);
+    }
+    .header-description {
+      text-align: center;
+      color: white;
+      margin-top: -15px;
+      margin-bottom: 30px;
+      opacity: 0.9;
+    }
+    .card {
+      background: white;
+      border-radius: 16px;
+      padding: 25px;
+      margin-bottom: 20px;
+      box-shadow: 0 10px 30px rgba(0,0,0,0.2);
+    }
+    .card h2 {
+      color: #667eea;
+      margin-bottom: 20px;
+      border-bottom: 2px solid #e0e0e0;
+      padding-bottom: 10px;
+    }
+    .endpoint {
+      background: #f5f5f5;
+      padding: 12px 15px;
+      border-radius: 8px;
+      font-family: monospace;
+      word-break: break-all;
+    }
+    .upstream-table {
+      width: 100%;
+      border-collapse: collapse;
+    }
+    .upstream-table th, .upstream-table td {
+      padding: 10px;
+      text-align: left;
+      border-bottom: 1px solid #eee;
+    }
+    .upstream-table th {
+      background: #f8f9fa;
+      font-weight: 600;
+    }
+    .status-online { color: #4caf50; font-weight: bold; }
+    .status-offline { color: #f44336; font-weight: bold; }
+    .status-checking { color: #ff9800; }
+    .query-box {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      margin-bottom: 20px;
+    }
+    .query-box input {
+      flex: 2;
+      padding: 12px 15px;
+      border: 2px solid #e0e0e0;
+      border-radius: 8px;
+      font-size: 16px;
+    }
+    .query-box input:focus {
+      outline: none;
+      border-color: #667eea;
+    }
+    .query-box select, .query-box button {
+      padding: 12px 15px;
+      border-radius: 8px;
+      font-size: 16px;
+    }
+    .query-box select {
+      border: 2px solid #e0e0e0;
+      background: white;
+      cursor: pointer;
+    }
+    .query-box button {
+      background: #667eea;
+      color: white;
+      border: none;
+      cursor: pointer;
+      transition: background 0.3s;
+    }
+    .query-box button:hover { background: #5a67d8; }
+    .result {
+      background: #f7f7f7;
+      padding: 20px;
+      border-radius: 10px;
+      font-family: monospace;
+      font-size: 13px;
+      margin-top: 20px;
+      display: none;
+      overflow-x: auto;
+      border-left: 4px solid #667eea;
+    }
+    .result.show { display: block; }
+    .result.error { border-left-color: #f44336; background: #ffebee; }
+    .loading {
+      display: inline-block;
+      width: 20px;
+      height: 20px;
+      border: 2px solid #f3f3f3;
+      border-top: 2px solid #667eea;
+      border-radius: 50%;
+      animation: spin 1s linear infinite;
+      margin-right: 10px;
+      vertical-align: middle;
+    }
+    @keyframes spin {
+      0% { transform: rotate(0deg); }
+      100% { transform: rotate(360deg); }
+    }
+    .footer { text-align: center; color: white; margin-top: 30px; opacity: 0.8; }
+    .record-card {
+      background: #f8f9fa;
+      border-radius: 8px;
+      padding: 15px;
+      margin-bottom: 15px;
+    }
+    .record-title {
+      font-weight: bold;
+      color: #667eea;
+      margin-bottom: 10px;
+      border-left: 3px solid #667eea;
+      padding-left: 10px;
+    }
+    .record-item {
+      padding: 5px 0;
+      border-bottom: 1px solid #e0e0e0;
+      font-family: monospace;
+    }
+    .current-info {
+      background: #e8f4f8;
+      padding: 10px 15px;
+      border-radius: 8px;
+      margin-top: 15px;
+    }
+    .curl-example {
+      background: #1e1e1e;
+      color: #d4d4d4;
+      padding: 15px;
+      border-radius: 8px;
+      font-family: monospace;
+      font-size: 13px;
+      overflow-x: auto;
+      white-space: pre-wrap;
+      word-break: break-all;
+      margin: 8px 0;
+    }
+    .curl-example a {
+      color: #66d9ef;
+    }
+    .tag {
+      display: inline-block;
+      background: #667eea;
+      color: white;
+      font-size: 12px;
+      padding: 2px 10px;
+      border-radius: 12px;
+      margin-right: 6px;
+    }
+    @media (max-width: 768px) {
+      .upstream-table { font-size: 12px; }
+      .upstream-table th, .upstream-table td { padding: 6px; }
+      .header { flex-direction: column; text-align: center; }
+      .header h1 { font-size: 1.8em; }
+      .header-sub { text-align: center; }
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <h1>🖥️ DNS over HTTPS Server</h1>
+      <div class="header-sub">
+        <a href="${adminUrl}" class="login-btn">
+          🔐 管理员登录
+        </a>
+      </div>
     </div>
-    <div class="card-body">
-      <div id="loading" class="loading"><div class="loading-spinner"></div><p>正在查询中，请稍候...</p></div>
-      <div id="resultContainer" style="display: none;">
-        <ul class="nav nav-tabs" id="resultTabs">
-          <li class="nav-item"><button class="nav-link active" id="ipv4-tab" data-bs-toggle="tab" data-bs-target="#ipv4">IPv4</button></li>
-          <li class="nav-item"><button class="nav-link" id="ipv6-tab" data-bs-toggle="tab" data-bs-target="#ipv6">IPv6</button></li>
-          <li class="nav-item"><button class="nav-link" id="ns-tab" data-bs-toggle="tab" data-bs-target="#ns">NS</button></li>
-          <li class="nav-item"><button class="nav-link" id="raw-tab" data-bs-toggle="tab" data-bs-target="#raw">原始</button></li>
-        </ul>
-        <div class="tab-content">
-          <div class="tab-pane fade show active" id="ipv4"><div id="ipv4Summary"></div><div id="ipv4Records"></div></div>
-          <div class="tab-pane fade" id="ipv6"><div id="ipv6Summary"></div><div id="ipv6Records"></div></div>
-          <div class="tab-pane fade" id="ns"><div id="nsSummary"></div><div id="nsRecords"></div></div>
-          <div class="tab-pane fade" id="raw"><pre id="result">等待查询...</pre></div>
+    <div class="header-description">
+      <p>纯 DoH 服务 | 多记录类型 | 支持 GET/POST & Wire Format</p>
+    </div>
+
+    <div class="card">
+      <h2>📊 服务状态</h2>
+      <p><strong>🔗 DoH 端点：</strong></p>
+      <div class="endpoint" id="endpoint"></div>
+      <div class="current-info" id="currentInfo"></div>
+    </div>
+
+    <div class="card">
+      <h2>🌐 上游 DNS 服务器</h2>
+      <div style="overflow-x: auto;">
+        <table class="upstream-table">
+          <thead>
+            <tr><th>状态</th><th>上游服务器</th><th>区域</th><th>响应时间</th></tr>
+          </thead>
+          <tbody id="upstreamList"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>🔧 DNS 查询工具</h2>
+      <div class="query-box">
+        <input type="text" id="domain" placeholder="域名，如: google.com" value="google.com">
+        <select id="recordType">
+          <option value="A">A (IPv4 地址)</option>
+          <option value="AAAA">AAAA (IPv6 地址)</option>
+          <option value="CNAME">CNAME (规范名称)</option>
+          <option value="MX">MX (邮件交换)</option>
+          <option value="TXT">TXT (文本记录)</option>
+          <option value="NS">NS (域名服务器)</option>
+          <option value="HTTPS">HTTPS (ECH配置)</option>
+          <option value="all" selected>全部 (A/AAAA/MX/TXT/NS/CNAME)</option>
+        </select>
+        <button onclick="queryDNS()" id="queryBtn">🚀 查询</button>
+      </div>
+      <div id="result" class="result"></div>
+    </div>
+
+    <!-- ========== 完整的“使用示例”卡片（简洁风格） ========== -->
+    <div class="card">
+      <h2>📖 使用示例</h2>
+      <div style="font-size:14px; margin-bottom:12px; color:#555;">
+        以下命令中的端点 <code>${currentDohUrl}</code> 已自动替换为您的实际地址，可直接复制运行。
+      </div>
+
+      <!-- 1. GET JSON -->
+      <div style="margin-bottom:16px; border-left:3px solid #667eea; padding-left:12px;">
+        <div style="font-weight:bold; color:#667eea;">1️⃣ GET 请求 – JSON 格式（?name=）</div>
+        <div class="curl-example"># A 记录 (IPv4)
+curl -H "accept: application/dns-json" \\
+  "${currentDohUrl}?name=google.com&type=A"
+
+# AAAA 记录 (IPv6)
+curl -H "accept: application/dns-json" \\
+  "${currentDohUrl}?name=google.com&type=AAAA"
+
+# HTTPS 记录 (ECH 配置)
+curl -H "accept: application/dns-json" \\
+  "${currentDohUrl}?name=cloudflare-ech.com&type=HTTPS"</div>
+        <div style="font-size:13px; color:#666;">预期：返回 JSON，Answer 中包含对应记录。</div>
+      </div>
+
+      <!-- 2. GET Wire Format -->
+      <div style="margin-bottom:16px; border-left:3px solid #667eea; padding-left:12px;">
+        <div style="font-weight:bold; color:#667eea;">2️⃣ GET 请求 – Wire Format（?dns=）</div>
+        <div class="curl-example"># 查询 google.com A 记录（Base64URL 编码示例）
+curl -H "accept: application/dns-message" \\
+  "${currentDohUrl}?dns=AAABAAABAAAAAAAAB2V4YW1wbGUDY29tAAABAAE"</div>
+        <div style="font-size:13px; color:#666;">
+          预期：返回二进制 DNS 数据（终端会显示乱码，这是正常的）。<br>
+          验证响应头：<code>content-type: application/dns-message</code>
         </div>
       </div>
-      <div id="errorContainer" style="display: none;"><pre id="errorMessage" class="error-message"></pre></div>
+
+      <!-- 3. POST JSON -->
+      <div style="margin-bottom:16px; border-left:3px solid #667eea; padding-left:12px;">
+        <div style="font-weight:bold; color:#667eea;">3️⃣ POST 请求 – JSON Body</div>
+        <div class="curl-example"># A 记录查询
+curl -X POST -H "Content-Type: application/dns-json" \\
+  -d '{"name":"google.com","type":"A"}' \\
+  "${currentDohUrl}"
+
+# HTTPS 记录查询
+curl -X POST -H "Content-Type: application/dns-json" \\
+  -d '{"name":"cloudflare-ech.com","type":"HTTPS"}' \\
+  "${currentDohUrl}"</div>
+        <div style="font-size:13px; color:#666;">预期：返回 JSON，Answer 中包含记录。</div>
+      </div>
+
+      <!-- 4. POST 表单 -->
+      <div style="margin-bottom:16px; border-left:3px solid #667eea; padding-left:12px;">
+        <div style="font-weight:bold; color:#667eea;">4️⃣ POST 请求 – 表单格式</div>
+        <div class="curl-example">curl -X POST -H "Content-Type: application/x-www-form-urlencoded" \\
+  -d "name=google.com&type=A" \\
+  "${currentDohUrl}"</div>
+        <div style="font-size:13px; color:#666;">预期：返回 JSON，Answer 中包含 IPv4 地址。</div>
+      </div>
+
+      <!-- 5. POST Wire Format -->
+      <div style="margin-bottom:16px; border-left:3px solid #667eea; padding-left:12px;">
+        <div style="font-weight:bold; color:#667eea;">5️⃣ POST 请求 – Wire Format（原始二进制）
+# 发送二进制数据
+echo -n "AAABAAABAAAAAAAAB2V4YW1wbGUDY29tAAABAAE" | base64 -d > query.bin
+curl -X POST -H "Content-Type: application/dns-message" --data-binary @query.bin \\
+  "${currentDohUrl}"</div>
+        <div style="font-size:13px; color:#666;">
+          预期：返回二进制 DNS 响应（终端显示乱码）。<br>
+          验证响应头：<code>content-type: application/dns-message</code>
+        </div>
+      </div>
+
+      <!-- 浏览器配置 -->
+      <div style="border-top:1px solid #e0e0e0; padding-top:12px; margin-top:8px;">
+        <div style="font-weight:bold; color:#667eea;">🌐 浏览器访问 & 配置 DoH</div>
+        <div class="curl-example" style="background:#f0f0f0; color:#333;">
+          # 浏览器直接访问（显示 JSON）
+          <a href="${currentDohUrl}?name=google.com&type=A" target="_blank">${currentDohUrl}?name=google.com&type=A</a>
+
+          # Chrome/Edge 配置 DoH
+          设置 → 隐私和安全 → 安全 → 使用安全 DNS → 自定义
+          填入：<strong>${currentDohUrl}</strong>
+        </div>
+      </div>
+
+      <!-- 诊断命令 -->
+      <div style="margin-top:12px; border-top:1px solid #e0e0e0; padding-top:12px;">
+        <div style="font-weight:bold; color:#667eea;">🔍 诊断辅助命令</div>
+        <div class="curl-example" style="background:#f0f0f0; color:#333;">
+# 查看完整响应头（确认 Content-Type）
+curl -I "${currentDohUrl}?name=google.com&type=A"
+
+# 查看 wire format 响应头
+curl -I -H "accept: application/dns-message" \\
+  "${currentDohUrl}?dns=AAABAAABAAAAAAAAB2V4YW1wbGUDY29tAAABAAE"
+
+# 保存 wire format 响应到文件（避免终端乱码）
+curl -H "accept: application/dns-message" \\
+  "${currentDohUrl}?dns=AAABAAABAAAAAAAAB2V4YW1wbGUDY29tAAABAAE" \\
+  --output response.bin
+</div>
+      </div>
+    </div>
+
+    <div class="footer">
+      <p>🚀 Node.js DoH Server | 公开服务 - 管理员可切换上游</p>
     </div>
   </div>
 
-  <div class="info-line">
-    <strong>DoH 端点：</strong><span id="dohUrlDisplay" class="copy-link" title="点击复制">https://<span id="currentDomain">${hostname}</span>/${dohPath}</span>
-    <br>
-    <span id="upstreamInfo">
-      ${autoSelect ? '⚡ 当前模式：<strong>自动选择</strong>（每次请求实时选取最快上游）' : `🔒 固定上游：<strong>${fixedUpstreamName}</strong>`}
-    </span>
-    <br>
-    <small>管理员可在后台更改配置</small>
-  </div>
-</div>
-<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
-<script>
-  const currentHost = window.location.host;
-  const currentProtocol = window.location.protocol;
-  const currentDohPath = '${dohPath}';
-  const dohEndpoint = currentProtocol + '//' + currentHost + '/' + currentDohPath;
+  <script>
+    const endpoint = '${currentDohUrl}';
+    document.getElementById('endpoint').innerHTML = endpoint;
 
-  const 阻断IPv4 = ['104.21.16.1','104.21.32.1','104.21.48.1','104.21.64.1','104.21.80.1','104.21.96.1','104.21.112.1'];
-  const 阻断IPv6 = ['2606:4700:3030::6815:1001','2606:4700:3030::6815:3001','2606:4700:3030::6815:7001','2606:4700:3030::6815:5001'];
-  function isBlockedIP(ip) { return 阻断IPv4.includes(ip) || 阻断IPv6.includes(ip); }
-
-  document.getElementById('clearBtn').addEventListener('click', function() {
-    document.getElementById('domain').value = '';
-    document.getElementById('domain').focus();
-  });
-
-  document.getElementById('copyBtn').addEventListener('click', function() {
-    const text = document.getElementById('result').textContent;
-    navigator.clipboard.writeText(text).then(() => {
-      const orig = this.textContent;
-      this.textContent = '已复制';
-      setTimeout(() => { this.textContent = orig; }, 2000);
-    }).catch(err => console.error(err));
-  });
-
-  function formatTTL(sec) {
-    if (sec < 60) return sec + '秒';
-    if (sec < 3600) return Math.floor(sec/60) + '分钟';
-    if (sec < 86400) return Math.floor(sec/3600) + '小时';
-    return Math.floor(sec/86400) + '天';
-  }
-
-  async function queryIpGeoInfo(ip) {
-    try {
-      const resp = await fetch(\`./ip-info?ip=\${ip}&token=${dohPath}\`);
-      if (!resp.ok) throw new Error('HTTP ' + resp.status);
-      return await resp.json();
-    } catch(e) { console.error(e); return null; }
-  }
-
-  function handleCopyClick(el, text) {
-    navigator.clipboard.writeText(text).then(() => {
-      el.classList.add('copied');
-      setTimeout(() => el.classList.remove('copied'), 2000);
-    }).catch(err => console.error(err));
-  }
-
-  function displayRecords(data) {
-    document.getElementById('resultContainer').style.display = 'block';
-    document.getElementById('errorContainer').style.display = 'none';
-    document.getElementById('result').textContent = JSON.stringify(data, null, 2);
-
-    const ipv4Records = data.ipv4?.records || [];
-    const ipv4Container = document.getElementById('ipv4Records');
-    ipv4Container.innerHTML = '';
-    if (ipv4Records.length === 0) {
-      document.getElementById('ipv4Summary').innerHTML = '<strong>未找到 IPv4 记录</strong>';
-    } else {
-      document.getElementById('ipv4Summary').innerHTML = \`<strong>找到 \${ipv4Records.length} 条 IPv4 记录</strong>\`;
-      ipv4Records.forEach(record => {
-        const div = document.createElement('div');
-        div.className = 'ip-record';
-        if (record.type === 5) {
-          div.innerHTML = \`
-            <div class="d-flex justify-content-between align-items-center">
-              <span class="ip-address" data-copy="\${record.data}">\${record.data}</span>
-              <span class="badge bg-success">CNAME</span>
-              <span class="text-muted ttl-info">TTL: \${formatTTL(record.TTL)}</span>
-            </div>
-          \`;
-          ipv4Container.appendChild(div);
-          const copyEl = div.querySelector('.ip-address');
-          copyEl.addEventListener('click', function() { handleCopyClick(this, this.dataset.copy); });
-        } else if (record.type === 1) {
-          div.innerHTML = \`
-            <div class="d-flex justify-content-between align-items-center">
-              <span class="ip-address" data-copy="\${record.data}">\${record.data}</span>
-              <span class="geo-info geo-loading">正在获取位置信息...</span>
-              <span class="text-muted ttl-info">TTL: \${formatTTL(record.TTL)}</span>
-            </div>
-          \`;
-          ipv4Container.appendChild(div);
-          const copyEl = div.querySelector('.ip-address');
-          copyEl.addEventListener('click', function() { handleCopyClick(this, this.dataset.copy); });
-          const geoSpan = div.querySelector('.geo-info');
-          const ip = record.data;
-          if (isBlockedIP(ip)) {
-            queryIpGeoInfo(ip).then(geo => {
-              geoSpan.innerHTML = ''; geoSpan.classList.remove('geo-loading');
-              const b = document.createElement('span'); b.className = 'geo-blocked'; b.textContent = '阻断IP';
-              geoSpan.appendChild(b);
-              if (geo && geo.status === 'success' && geo.as) {
-                const as = document.createElement('span'); as.className = 'geo-as'; as.textContent = geo.as;
-                geoSpan.appendChild(as);
-              }
-            }).catch(() => {
-              geoSpan.innerHTML = ''; geoSpan.classList.remove('geo-loading');
-              const b = document.createElement('span'); b.className = 'geo-blocked'; b.textContent = '阻断IP';
-              geoSpan.appendChild(b);
-            });
-          } else {
-            queryIpGeoInfo(ip).then(geo => {
-              if (geo && geo.status === 'success') {
-                geoSpan.innerHTML = ''; geoSpan.classList.remove('geo-loading');
-                const c = document.createElement('span'); c.className = 'geo-country'; c.textContent = geo.country || '未知国家';
-                geoSpan.appendChild(c);
-                const as = document.createElement('span'); as.className = 'geo-as'; as.textContent = geo.as || '未知 AS';
-                geoSpan.appendChild(as);
-              } else {
-                geoSpan.textContent = '位置信息获取失败';
-              }
-            });
-          }
-        }
-      });
-    }
-
-    const ipv6Records = data.ipv6?.records || [];
-    const ipv6Container = document.getElementById('ipv6Records');
-    ipv6Container.innerHTML = '';
-    if (ipv6Records.length === 0) {
-      document.getElementById('ipv6Summary').innerHTML = '<strong>未找到 IPv6 记录</strong>';
-    } else {
-      document.getElementById('ipv6Summary').innerHTML = \`<strong>找到 \${ipv6Records.length} 条 IPv6 记录</strong>\`;
-      ipv6Records.forEach(record => {
-        const div = document.createElement('div');
-        div.className = 'ip-record';
-        if (record.type === 5) {
-          div.innerHTML = \`
-            <div class="d-flex justify-content-between align-items-center">
-              <span class="ip-address" data-copy="\${record.data}">\${record.data}</span>
-              <span class="badge bg-success">CNAME</span>
-              <span class="text-muted ttl-info">TTL: \${formatTTL(record.TTL)}</span>
-            </div>
-          \`;
-          ipv6Container.appendChild(div);
-          const copyEl = div.querySelector('.ip-address');
-          copyEl.addEventListener('click', function() { handleCopyClick(this, this.dataset.copy); });
-        } else if (record.type === 28) {
-          div.innerHTML = \`
-            <div class="d-flex justify-content-between align-items-center">
-              <span class="ip-address" data-copy="\${record.data}">\${record.data}</span>
-              <span class="geo-info geo-loading">正在获取位置信息...</span>
-              <span class="text-muted ttl-info">TTL: \${formatTTL(record.TTL)}</span>
-            </div>
-          \`;
-          ipv6Container.appendChild(div);
-          const copyEl = div.querySelector('.ip-address');
-          copyEl.addEventListener('click', function() { handleCopyClick(this, this.dataset.copy); });
-          const geoSpan = div.querySelector('.geo-info');
-          const ip = record.data;
-          if (isBlockedIP(ip)) {
-            queryIpGeoInfo(ip).then(geo => {
-              geoSpan.innerHTML = ''; geoSpan.classList.remove('geo-loading');
-              const b = document.createElement('span'); b.className = 'geo-blocked'; b.textContent = '阻断IP';
-              geoSpan.appendChild(b);
-              if (geo && geo.status === 'success' && geo.as) {
-                const as = document.createElement('span'); as.className = 'geo-as'; as.textContent = geo.as;
-                geoSpan.appendChild(as);
-              }
-            }).catch(() => {
-              geoSpan.innerHTML = ''; geoSpan.classList.remove('geo-loading');
-              const b = document.createElement('span'); b.className = 'geo-blocked'; b.textContent = '阻断IP';
-              geoSpan.appendChild(b);
-            });
-          } else {
-            queryIpGeoInfo(ip).then(geo => {
-              if (geo && geo.status === 'success') {
-                geoSpan.innerHTML = ''; geoSpan.classList.remove('geo-loading');
-                const c = document.createElement('span'); c.className = 'geo-country'; c.textContent = geo.country || '未知国家';
-                geoSpan.appendChild(c);
-                const as = document.createElement('span'); as.className = 'geo-as'; as.textContent = geo.as || '未知 AS';
-                geoSpan.appendChild(as);
-              } else {
-                geoSpan.textContent = '位置信息获取失败';
-              }
-            });
-          }
-        }
-      });
-    }
-
-    const nsRecords = data.ns?.records || [];
-    const nsContainer = document.getElementById('nsRecords');
-    nsContainer.innerHTML = '';
-    if (nsRecords.length === 0) {
-      document.getElementById('nsSummary').innerHTML = '<strong>未找到 NS 记录</strong>';
-    } else {
-      document.getElementById('nsSummary').innerHTML = \`<strong>找到 \${nsRecords.length} 条名称服务器记录</strong>\`;
-      nsRecords.forEach(record => {
-        const div = document.createElement('div');
-        div.className = 'ip-record';
-        if (record.type === 2) {
-          div.innerHTML = \`
-            <div class="d-flex justify-content-between align-items-center">
-              <span class="ip-address" data-copy="\${record.data}">\${record.data}</span>
-              <span class="badge bg-info">NS</span>
-              <span class="text-muted ttl-info">TTL: \${formatTTL(record.TTL)}</span>
-            </div>
-          \`;
-          nsContainer.appendChild(div);
-          const copyEl = div.querySelector('.ip-address');
-          copyEl.addEventListener('click', function() { handleCopyClick(this, this.dataset.copy); });
-        } else if (record.type === 6) {
-          const parts = record.data.split(' ');
-          let adminEmail = parts[1].replace('.', '@');
-          if (adminEmail.endsWith('.')) adminEmail = adminEmail.slice(0, -1);
-          div.innerHTML = \`
-            <div class="d-flex justify-content-between align-items-center mb-2">
-              <span class="ip-address" data-copy="\${record.name}">\${record.name}</span>
-              <span class="badge bg-warning">SOA</span>
-              <span class="text-muted ttl-info">TTL: \${formatTTL(record.TTL)}</span>
-            </div>
-            <div class="ps-3 small">
-              <div><strong>主 NS:</strong> <span class="ip-address" data-copy="\${parts[0]}">\${parts[0]}</span></div>
-              <div><strong>管理邮箱:</strong> <span class="ip-address" data-copy="\${adminEmail}">\${adminEmail}</span></div>
-              <div><strong>序列号:</strong> \${parts[2]}</div>
-              <div><strong>刷新间隔:</strong> \${formatTTL(parts[3])}</div>
-              <div><strong>重试间隔:</strong> \${formatTTL(parts[4])}</div>
-              <div><strong>过期时间:</strong> \${formatTTL(parts[5])}</div>
-              <div><strong>最小 TTL:</strong> \${formatTTL(parts[6])}</div>
-            </div>
-          \`;
-          nsContainer.appendChild(div);
-          div.querySelectorAll('.ip-address').forEach(el => {
-            el.addEventListener('click', function() { handleCopyClick(this, this.dataset.copy); });
-          });
-        } else {
-          div.innerHTML = \`
-            <div class="d-flex justify-content-between align-items-center">
-              <span class="ip-address" data-copy="\${record.data}">\${record.data}</span>
-              <span class="badge bg-secondary">类型: \${record.type}</span>
-              <span class="text-muted ttl-info">TTL: \${formatTTL(record.TTL)}</span>
-            </div>
-          \`;
-          nsContainer.appendChild(div);
-          const copyEl = div.querySelector('.ip-address');
-          copyEl.addEventListener('click', function() { handleCopyClick(this, this.dataset.copy); });
-        }
-      });
-    }
-
-    document.getElementById('copyBtn').style.display = 'block';
-  }
-
-  function displayError(msg) {
-    document.getElementById('resultContainer').style.display = 'none';
-    document.getElementById('errorContainer').style.display = 'block';
-    document.getElementById('errorMessage').textContent = msg;
-    document.getElementById('copyBtn').style.display = 'none';
-  }
-
-  document.getElementById('resolveForm').addEventListener('submit', async function(e) {
-    e.preventDefault();
-    const domain = document.getElementById('domain').value;
-    if (!domain) { alert('请输入域名'); return; }
-
-    document.getElementById('loading').style.display = 'block';
-    document.getElementById('resultContainer').style.display = 'none';
-    document.getElementById('errorContainer').style.display = 'none';
-    document.getElementById('copyBtn').style.display = 'none';
-
-    try {
-      const resp = await fetch(\`/\${currentDohPath}?name=\${encodeURIComponent(domain)}&type=all\`);
-      if (!resp.ok) throw new Error('HTTP ' + resp.status);
-      const json = await resp.json();
-      if (json.error) displayError(json.error);
-      else displayRecords(json);
-    } catch(err) {
-      displayError('查询失败: ' + err.message);
-    } finally {
-      document.getElementById('loading').style.display = 'none';
-    }
-  });
-
-  document.addEventListener('DOMContentLoaded', function() {
-    const lastDomain = localStorage.getItem('lastDomain');
-    if (lastDomain) document.getElementById('domain').value = lastDomain;
-    document.getElementById('domain').addEventListener('input', function() {
-      localStorage.setItem('lastDomain', this.value);
-    });
-    document.getElementById('currentDomain').textContent = currentHost;
-
-    const dohUrlDisplay = document.getElementById('dohUrlDisplay');
-    if (dohUrlDisplay) {
-      dohUrlDisplay.addEventListener('click', function() {
-        const text = currentProtocol + '//' + currentHost + '/' + currentDohPath;
-        navigator.clipboard.writeText(text).then(() => {
-          this.classList.add('copied');
-          setTimeout(() => this.classList.remove('copied'), 2000);
-        }).catch(err => console.error(err));
-      });
-    }
-
-    document.getElementById('getJsonBtn').addEventListener('click', function() {
-      const domain = document.getElementById('domain').value;
-      if (!domain) { alert('请输入域名'); return; }
-      const jsonUrl = new URL(dohEndpoint);
-      jsonUrl.searchParams.set('name', domain);
-      window.open(jsonUrl.toString(), '_blank');
-    });
-  });
-</script>
-</body>
-</html>`, {
-    headers: { 'Content-Type': 'text/html;charset=UTF-8' }
-  });
-}
-
-// ==================== DoH 代理核心（使用实时最快选择） ====================
-async function DOHRequest(request, env, config) {
-  const url = new URL(request.url);
-  let serverId = url.searchParams.get('server');
-  let upstream = null;
-
-  if (serverId) {
-    upstream = config.upstreams.find(u => u.id === serverId && u.enabled);
-    if (!upstream) {
-      return new Response('指定的上游不存在或已禁用', { status: 400 });
-    }
-  } else {
-    if (config.enable_auto_select) {
-      // 实时选择最快上游（使用请求的域名和类型）
-      const domain = url.searchParams.get('name') || 'google.com';
-      const type = url.searchParams.get('type') || 'A';
-      const fastest = await selectFastestUpstream(env, config, domain, type);
-      if (fastest) upstream = fastest;
-    }
-    // 若未启用自动选择或自动选择失败，使用默认
-    if (!upstream) {
-      const fallback = config.upstreams.find(u => u.id === config.default && u.enabled);
-      if (fallback) upstream = fallback;
-    }
-    if (!upstream) {
-      return new Response('没有可用的上游服务器', { status: 503 });
-    }
-  }
-
-  // 直接转发到选中的上游（无需故障转移，因为实时选择已保证可用）
-  try {
-    return await forwardToUpstream(request, upstream);
-  } catch (err) {
-    // 如果选中的上游失败，尝试故障转移（简单重试其他）
-    const allEnabled = config.upstreams.filter(u => u.enabled && u.id !== upstream.id);
-    for (const fallback of allEnabled) {
+    async function loadUpstreams() {
       try {
-        return await forwardToUpstream(request, fallback);
-      } catch (_) {}
-    }
-    return new Response(JSON.stringify({ error: `所有上游均失败: ${err.message}` }), {
-      status: 502,
-      headers: { 'Content-Type': 'application/json' }
-    });
-  }
-}
-
-async function forwardToUpstream(request, upstream) {
-  const url = new URL(request.url);
-  const method = request.method;
-  const searchParams = url.searchParams;
-  const domain = searchParams.get('name');
-  const UA = request.headers.get('User-Agent') || 'DoH Client';
-
-  if (searchParams.get('type') === 'all' && domain) {
-    const result = await queryMultipleTypes(upstream.url, domain);
-    return json(result);
-  }
-
-  if (method === 'GET') {
-    if (searchParams.has('name')) {
-      const type = searchParams.get('type') || 'A';
-      const searchDoH = searchParams.has('type') ? url.search : url.search + '&type=A';
-      let response = await fetch(upstream.url + searchDoH, {
-        headers: { 'Accept': 'application/dns-json', 'User-Agent': UA }
-      });
-      if (!response.ok) {
-        const resolveUrl = upstream.url.replace(/\/dns-query$/, '/resolve');
-        if (resolveUrl !== upstream.url) {
-          response = await fetch(resolveUrl + searchDoH, {
-            headers: { 'Accept': 'application/dns-json', 'User-Agent': UA }
-          });
-        }
-      }
-      if (!response.ok) throw new Error(`Upstream error ${response.status}`);
-      const respHeaders = new Headers(response.headers);
-      respHeaders.set('Access-Control-Allow-Origin', '*');
-      respHeaders.set('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-      respHeaders.set('Access-Control-Allow-Headers', '*');
-      respHeaders.set('Content-Type', 'application/json');
-      return new Response(response.body, { status: response.status, headers: respHeaders });
-    }
-    if (url.search) {
-      const response = await fetch(upstream.url + url.search, {
-        headers: { 'Accept': 'application/dns-message', 'User-Agent': UA }
-      });
-      if (!response.ok) throw new Error(`Upstream error ${response.status}`);
-      const respHeaders = new Headers(response.headers);
-      respHeaders.set('Access-Control-Allow-Origin', '*');
-      respHeaders.set('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-      respHeaders.set('Access-Control-Allow-Headers', '*');
-      return new Response(response.body, { status: response.status, headers: respHeaders });
-    }
-    throw new Error('Bad Request: missing name or dns parameter');
-  }
-
-  if (method === 'POST') {
-    const contentType = request.headers.get('Content-Type') || '';
-    if (contentType.includes('application/dns-message')) {
-      const response = await fetch(upstream.url, {
-        method: 'POST',
-        headers: {
-          'Accept': 'application/dns-message',
-          'Content-Type': 'application/dns-message',
-          'User-Agent': UA
-        },
-        body: request.body
-      });
-      if (!response.ok) throw new Error(`Upstream error ${response.status}`);
-      const respHeaders = new Headers(response.headers);
-      respHeaders.set('Access-Control-Allow-Origin', '*');
-      respHeaders.set('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-      respHeaders.set('Access-Control-Allow-Headers', '*');
-      return new Response(response.body, { status: response.status, headers: respHeaders });
-    } else if (contentType.includes('application/dns-json')) {
-      const jsonBody = await request.json();
-      const name = jsonBody.name;
-      const type = jsonBody.type || 'A';
-      if (!name) throw new Error('Missing "name" in JSON body');
-      const targetUrl = new URL(upstream.url);
-      targetUrl.searchParams.set('name', name);
-      targetUrl.searchParams.set('type', type);
-      const response = await fetch(targetUrl.toString(), {
-        headers: { 'Accept': 'application/dns-json', 'User-Agent': UA }
-      });
-      if (!response.ok) throw new Error(`Upstream error ${response.status}`);
-      const data = await response.json();
-      return json(data);
-    } else if (contentType.includes('application/x-www-form-urlencoded')) {
-      const formData = await request.formData();
-      const name = formData.get('name');
-      const type = formData.get('type') || 'A';
-      if (!name) throw new Error('Missing "name" in form data');
-      const targetUrl = new URL(upstream.url);
-      targetUrl.searchParams.set('name', name);
-      targetUrl.searchParams.set('type', type);
-      const response = await fetch(targetUrl.toString(), {
-        headers: { 'Accept': 'application/dns-json', 'User-Agent': UA }
-      });
-      if (!response.ok) throw new Error(`Upstream error ${response.status}`);
-      const data = await response.json();
-      return json(data);
-    } else {
-      throw new Error('Unsupported Content-Type for POST');
-    }
-  }
-
-  throw new Error('Method Not Allowed');
-}
-
-// ==================== IP 地理位置代理 ====================
-async function handleIpInfo(request, env) {
-  const url = new URL(request.url);
-  if (env.TOKEN) {
-    const token = url.searchParams.get('token');
-    if (token !== env.TOKEN) {
-      return json({ status: 'error', message: 'Token不正确' }, 403);
-    }
-  }
-  const ip = url.searchParams.get('ip') || request.headers.get('CF-Connecting-IP');
-  if (!ip) return json({ error: 'IP参数未提供' }, 400);
-  try {
-    const resp = await fetch(`http://ip-api.com/json/${ip}?lang=zh-CN`);
-    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-    const data = await resp.json();
-    data.timestamp = new Date().toISOString();
-    return json(data);
-  } catch (err) {
-    return json({ error: err.message }, 500);
-  }
-}
-
-// ==================== 主入口 ====================
-export default {
-  async fetch(request, env) {
-    const url = new URL(request.url);
-    const path = url.pathname;
-    const method = request.method;
-
-    if (method === 'OPTIONS') {
-      return new Response(null, {
-        headers: {
-          'Access-Control-Allow-Origin': '*',
-          'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
-          'Access-Control-Allow-Headers': '*',
-          'Access-Control-Max-Age': '86400'
-        }
-      });
-    }
-
-    // 管理员登录 API
-    if (path === '/api/admin/login' && method === 'POST') {
-      return await handleLogin(request, env);
-    }
-    if (path === '/api/admin/logout' && method === 'POST') {
-      const auth = await requireAdmin(env, request);
-      if (auth) return auth;
-      await destroySession(env, request);
-      return json({ success: true });
-    }
-
-    // 管理 API
-    if (path.startsWith('/api/admin/')) {
-      return await handleAdminAPI(request, env, url);
-    }
-
-    // 公共 API：上游列表
-    if (path === '/api/public/upstreams') {
-      return await handlePublicUpstreams(env);
-    }
-
-    // 管理员页面
-    if (path === '/admin') {
-      const username = await validateSession(env, request);
-      if (username) {
-        return new Response(renderAdminPage(), { headers: { 'Content-Type': 'text/html;charset=UTF-8' } });
-      } else {
-        return new Response(renderLoginPage(), { headers: { 'Content-Type': 'text/html;charset=UTF-8' } });
+        const response = await fetch('/api/upstreams');
+        const data = await response.json();
+        renderUpstreams(data.upstreams, data.mode, data.selectedId);
+        updateCurrentInfo(data.currentUpstream, data.mode);
+      } catch (err) {
+        console.error('加载失败:', err);
+        setTimeout(loadUpstreams, 3000);
       }
     }
 
-    // DoH 端点
-    const config = await getConfig(env);
-    const dohPath = config.doh_path || 'dns-query';
-    if (path === `/${dohPath}`) {
-      return await DOHRequest(request, env, config);
+    function renderUpstreams(upstreams, mode, selectedId) {
+      const tbody = document.getElementById('upstreamList');
+      if (!tbody) return;
+      tbody.innerHTML = '';
+
+      const sorted = [...upstreams].sort((a, b) => {
+        if (a.status === 'online' && b.status !== 'online') return -1;
+        if (a.status !== 'online' && b.status === 'online') return 1;
+        if (a.status === 'online' && b.status === 'online') {
+          return (a.responseTime || 9999) - (b.responseTime || 9999);
+        }
+        return 0;
+      });
+
+      sorted.forEach(u => {
+        const row = tbody.insertRow();
+
+        const statusCell = row.insertCell(0);
+        let statusText = '', statusClass = '';
+        switch(u.status) {
+          case 'online': statusText = '● 在线'; statusClass = 'status-online'; break;
+          case 'offline': statusText = '○ 离线'; statusClass = 'status-offline'; break;
+          default: statusText = '◐ 检测中'; statusClass = 'status-checking';
+        }
+        statusCell.innerHTML = '<span class="' + statusClass + '">' + statusText + '</span>';
+
+        const nameCell = row.insertCell(1);
+        let nameHtml = u.displayName;
+        if (mode === 'manual' && selectedId !== null && u.id === selectedId) {
+          nameHtml += ' <span style="background:#ff9800; color:white; padding:2px 8px; border-radius:4px; font-size:10px;">当前</span>';
+        }
+        nameCell.innerHTML = nameHtml;
+
+        const regionCell = row.insertCell(2);
+        regionCell.innerHTML = u.region || '全球';
+
+        const timeCell = row.insertCell(3);
+        timeCell.innerHTML = u.responseTime ? u.responseTime + 'ms' : '-';
+      });
     }
 
-    // IP 信息
-    if (path === '/ip-info') {
-      return await handleIpInfo(request, env);
+    function updateCurrentInfo(upstream, mode) {
+      const infoDiv = document.getElementById('currentInfo');
+      if (!infoDiv) return;
+      const modeText = mode === 'auto' ? '自动切换模式' : '手动固定模式';
+      infoDiv.innerHTML = '📡 当前使用: <strong>' + upstream + '</strong> | ' + modeText;
     }
 
-    // 兼容 ?doh= 参数
-    if (url.searchParams.has('doh')) {
-      const doh = url.searchParams.get('doh');
-      const domain = url.searchParams.get('domain') || url.searchParams.get('name');
-      const type = url.searchParams.get('type') || 'A';
-      if (!domain) return json({ error: '缺少 domain 参数' }, 400);
-      if (!doh.includes(url.hostname)) {
-        try {
-          let result;
-          if (type === 'all') {
-            result = await queryMultipleTypes(doh, domain);
+    function formatMXRecord(r) {
+      if (r.priority !== undefined) {
+        return '<span style="color:#666; font-size:11px;">[' + r.priority + ']</span> ' + r.exchange;
+      }
+      return r.data || String(r);
+    }
+
+    function displayResults(data, domain, type) {
+      let html = '<strong>✅ ' + domain + ' 查询结果</strong><br>';
+      if (data.upstream) html += '<small>📡 上游: ' + data.upstream + '</small><br><br>';
+
+      if (type === 'all') {
+        const types = ['A', 'AAAA', 'CNAME', 'MX', 'TXT', 'NS'];
+        for (let i = 0; i < types.length; i++) {
+          const t = types[i];
+          const records = data[t] || [];
+          html += '<div class="record-card">';
+          html += '<div class="record-title">📋 ' + t + ' 记录</div>';
+          if (records.length > 0) {
+            for (let j = 0; j < records.length; j++) {
+              const r = records[j];
+              if (t === 'MX') {
+                html += '<div class="record-item">' + formatMXRecord(r) + '</div>';
+              } else {
+                html += '<div class="record-item">' + (r.data || r.exchange || JSON.stringify(r)) + '</div>';
+              }
+            }
           } else {
-            result = await queryDns(doh, domain, type);
+            html += '<div class="record-item" style="color:#999;">无记录</div>';
           }
-          return json(result);
-        } catch (err) {
-          return json({ error: err.message }, 500);
+          html += '</div>';
         }
+      } else {
+        const records = data.Answer || [];
+        html += '<div class="record-card">';
+        html += '<div class="record-title">📋 ' + type + ' 记录</div>';
+        if (records.length > 0) {
+          for (let i = 0; i < records.length; i++) {
+            const r = records[i];
+            if (type === 'MX') {
+              html += '<div class="record-item">' + formatMXRecord(r) + '</div>';
+            } else {
+              html += '<div class="record-item">' + (r.data || JSON.stringify(r)) + '</div>';
+            }
+          }
+        } else {
+          html += '<div class="record-item" style="color:#999;">无记录</div>';
+        }
+        html += '</div>';
       }
-      const newUrl = new URL(url);
-      newUrl.pathname = `/${dohPath}`;
-      newUrl.searchParams.delete('doh');
-      newUrl.searchParams.set('name', domain);
-      newUrl.searchParams.set('type', type);
-      return await DOHRequest(new Request(newUrl.toString(), request), env, config);
+
+      return html;
     }
 
-    // 重定向 / 代理
-    if (env.URL302) return Response.redirect(env.URL302, 302);
-    if (env.URL) {
-      // 可扩展代理
+    async function queryDNS() {
+      const domain = document.getElementById('domain').value.trim();
+      const recordType = document.getElementById('recordType').value;
+      if (!domain) { alert('请输入域名'); return; }
+
+      const resultDiv = document.getElementById('result');
+      const queryBtn = document.getElementById('queryBtn');
+      resultDiv.innerHTML = '<span class="loading"></span> 正在查询...';
+      resultDiv.classList.add('show');
+      queryBtn.disabled = true;
+
+      try {
+        const url = '/api/dns?domain=' + encodeURIComponent(domain) + '&type=' + recordType;
+        const response = await fetch(url);
+        if (!response.ok) throw new Error('HTTP ' + response.status);
+        const data = await response.json();
+
+        resultDiv.innerHTML = displayResults(data, domain, recordType);
+        resultDiv.classList.remove('error');
+      } catch (err) {
+        resultDiv.innerHTML = '❌ 查询失败: ' + err.message;
+        resultDiv.classList.add('error');
+      } finally {
+        queryBtn.disabled = false;
+      }
     }
 
-    // 默认返回公共首页
-    return await renderPublicPage(env);
-  }
-};
+    document.getElementById('domain').addEventListener('keypress', function(e) {
+      if (e.key === 'Enter') queryDNS();
+    });
+
+    loadUpstreams();
+    setInterval(loadUpstreams, 10000);
+  </script>
+</body>
+</html>`;
+  res.send(html);
+});
+
+// ============ 健康检查端点 ============
+app.get('/health', (req, res) => {
+  const status = getCurrentStatus();
+  setJsonHeaders(res);
+  res.json({
+    status: 'ok',
+    timestamp: new Date().toISOString(),
+    dohPath: `/${DoH路径}`,
+    mode: status.mode,
+    currentUpstream: status.currentUpstream,
+    available: status.availableCount,
+    total: status.totalCount,
+    protocols: ['DoH']
+  });
+});
+
+// 启动服务器
+app.listen(PORT, '0.0.0.0', async () => {
+  console.log(`========================================`);
+  console.log(`🛡️ 纯 DoH 服务器已启动`);
+  console.log(`📡 端口: ${PORT}`);
+  console.log(`🔗 DoH 端点: /${DoH路径}`);
+  console.log(`🔐 管理员入口: /admin`);
+  console.log(`📋 默认账号: ${ADMIN_USER} / ${ADMIN_PASS}`);
+  console.log(`🌐 DoH 上游总数: ${upstreams.length}`);
+  console.log(`========================================`);
+
+  await healthCheck();
+  setInterval(healthCheck, 60000);
+});
+
+process.on('SIGTERM', () => {
+  console.log('正在关闭...');
+  process.exit(0);
+});
