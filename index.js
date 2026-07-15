@@ -9,29 +9,36 @@ const ADMIN_USER = process.env.ADMIN_USER || 'admin';
 const ADMIN_PASS = process.env.ADMIN_PASS || '123321';
 const SESSION_SECRET = process.env.SESSION_SECRET || 'doh-server-secret-key';
 
-// ============ Session 配置 ============
+// ============ Session 配置（HF Spaces 适用） ============
 app.use(session({
   secret: SESSION_SECRET,
   resave: false,
   saveUninitialized: false,
-  cookie: { secure: false, maxAge: 24 * 60 * 60 * 1000 }
+  cookie: {
+    secure: false,          // 必须为 false，因为 Spaces 内部是 HTTP
+    maxAge: 24 * 60 * 60 * 1000,
+    httpOnly: true,
+    sameSite: 'lax'
+  }
 }));
 
-// ============ DoH 路径配置 ============
+// ============ DoH 路径配置（规范化） ============
 let DoH路径 = process.env.DOH_PATH || process.env.TOKEN || 'dns-query';
 
-if (DoH路径.includes("/")) {
-  const parts = DoH路径.split("/");
+// 去除首尾斜杠
+DoH路径 = DoH路径.replace(/^\/+|\/+$/g, '');
+// 如果包含斜杠，取最后一段
+if (DoH路径.includes('/')) {
+  const parts = DoH路径.split('/');
   DoH路径 = parts[parts.length - 1];
 }
-
-if (!DoH路径 || DoH路径.length === 0 || DoH路径 === 'undefined') {
+// 只允许安全字符（字母、数字、连字符、下划线）
+DoH路径 = DoH路径.replace(/[^a-zA-Z0-9\-_]/g, '');
+if (!DoH路径 || DoH路径.length === 0) {
   DoH路径 = 'dns-query';
 }
 
-DoH路径 = DoH路径.replace(/[^a-zA-Z0-9\-_]/g, '');
-
-console.log(`📡 DoH 端点路径: /${DoH路径}`);
+console.log(`[INFO] ${new Date().toISOString()} 📡 DoH 端点路径: /${DoH路径}`);
 
 // ============ DNS 记录类型映射 ============
 const recordTypeMap = {
@@ -79,13 +86,25 @@ const upstreams = upstreamList.map((config, index) => ({
   responseTime: null
 }));
 
-console.log(`\n🌐 配置 DoH 上游总数: ${upstreams.length}`);
-console.log(`📋 上游列表: ${upstreams.map(u => u.displayName).join(', ')}`);
+console.log(`[INFO] ${new Date().toISOString()} 🌐 配置 DoH 上游总数: ${upstreams.length}`);
+console.log(`[INFO] ${new Date().toISOString()} 📋 上游列表: ${upstreams.map(u => u.displayName).join(', ')}`);
 
 let selectedUpstreamId = null;
 let availableUpstreams = [...upstreams];
+let sortedAvailable = [];          // 预排序缓存（按响应时间升序）
 let currentUpstreamIndex = 0;
 let healthCheckRunning = false;
+
+// ============ 辅助函数：HTML 转义（防 XSS） ============
+function escapeHtml(str) {
+  if (!str) return '';
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
 
 // ============ 健康检查 ============
 async function checkSingleUpstream(upstream) {
@@ -107,24 +126,17 @@ async function checkSingleUpstream(upstream) {
     upstream.lastCheck = new Date().toISOString();
     upstream.responseTime = isOnline ? Date.now() - startTime : null;
 
-    if (isOnline && !availableUpstreams.find(u => u.id === upstream.id)) {
-      availableUpstreams.push(upstream);
-    } else if (!isOnline) {
-      availableUpstreams = availableUpstreams.filter(u => u.id !== upstream.id);
-    }
-
     if (isOnline) {
-      console.log(`✅ ${upstream.displayName} - ${upstream.responseTime}ms`);
+      console.log(`[INFO] ${new Date().toISOString()} ✅ ${upstream.displayName} - ${upstream.responseTime}ms`);
     } else {
-      console.log(`❌ ${upstream.displayName} - 不可用`);
+      console.log(`[INFO] ${new Date().toISOString()} ❌ ${upstream.displayName} - 不可用`);
     }
     return isOnline;
   } catch (err) {
     upstream.status = 'offline';
     upstream.lastCheck = new Date().toISOString();
     upstream.responseTime = null;
-    availableUpstreams = availableUpstreams.filter(u => u.id !== upstream.id);
-    console.log(`❌ ${upstream.displayName} - 不可用 (${err.message})`);
+    console.log(`[ERROR] ${new Date().toISOString()} ❌ ${upstream.displayName} - 不可用 (${err.message})`);
     return false;
   }
 }
@@ -133,25 +145,28 @@ async function healthCheck() {
   if (healthCheckRunning) return;
   healthCheckRunning = true;
 
-  console.log(`\n🔍 开始健康检查 (${new Date().toLocaleTimeString()})`);
+  console.log(`[INFO] ${new Date().toISOString()} 🔍 开始健康检查`);
 
-  const results = await Promise.all(upstreams.map(u => checkSingleUpstream(u)));
-  const onlineCount = results.filter(r => r === true).length;
+  // 并行检查所有上游
+  await Promise.all(upstreams.map(u => checkSingleUpstream(u)));
 
-  if (availableUpstreams.length === 0) {
-    availableUpstreams = [...upstreams];
-  }
+  // 构建新的可用列表，并排序（避免并发修改）
+  const newAvailable = upstreams.filter(u => u.status === 'online');
+  newAvailable.sort((a, b) => (a.responseTime || 9999) - (b.responseTime || 9999));
 
-  availableUpstreams.sort((a, b) => (a.responseTime || 9999) - (b.responseTime || 9999));
+  // 原子更新
+  availableUpstreams = newAvailable;
+  sortedAvailable = [...availableUpstreams];  // 已排序
 
-  console.log(`📡 在线: ${onlineCount}/${upstreams.length}`);
+  console.log(`[INFO] ${new Date().toISOString()} 📡 在线: ${availableUpstreams.length}/${upstreams.length}`);
   if (availableUpstreams[0]) {
-    console.log(`📡 最快: ${availableUpstreams[0].displayName} (${availableUpstreams[0].responseTime}ms)`);
+    console.log(`[INFO] ${new Date().toISOString()} 📡 最快: ${availableUpstreams[0].displayName} (${availableUpstreams[0].responseTime}ms)`);
   }
 
   healthCheckRunning = false;
 }
 
+// ============ 获取当前上游（使用预排序缓存） ============
 function getCurrentUpstream() {
   if (selectedUpstreamId !== null) {
     const selected = upstreams.find(u => u.id === selectedUpstreamId);
@@ -161,14 +176,37 @@ function getCurrentUpstream() {
     selectedUpstreamId = null;
   }
 
-  const onlineSorted = [...availableUpstreams].sort((a, b) => (a.responseTime || 9999) - (b.responseTime || 9999));
-  if (onlineSorted.length > 0) {
-    const upstream = onlineSorted[currentUpstreamIndex % onlineSorted.length];
+  // 从排序缓存中轮询
+  if (sortedAvailable.length > 0) {
+    const upstream = sortedAvailable[currentUpstreamIndex % sortedAvailable.length];
     currentUpstreamIndex++;
     return upstream;
   }
 
+  // 降级：返回第一个（即使 offline）
   return upstreams[0];
+}
+
+// ============ 通用 fetch 重试函数（带 fallback） ============
+async function fetchWithFallback(endpoints, options, timeout = 10000) {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeout);
+  const signal = controller.signal;
+
+  let lastError = null;
+  for (const endpoint of endpoints) {
+    try {
+      const response = await fetch(endpoint, { ...options, signal });
+      clearTimeout(timeoutId);
+      if (response.ok) return response;
+      // 非 2xx 状态，继续尝试下一个
+      lastError = new Error(`HTTP ${response.status}`);
+    } catch (err) {
+      lastError = err;
+    }
+  }
+  clearTimeout(timeoutId);
+  throw lastError || new Error('所有上游均失败');
 }
 
 // ============ 核心查询函数 ============
@@ -195,29 +233,32 @@ async function queryDoH(server, domain, type, timeout = 10000) {
     }
   } catch (err) {
     clearTimeout(timeoutId);
-    throw err;
+    return { success: false, data: null, error: err.message };
   }
 }
 
 async function queryDNS(upstream, domain, type) {
-  const result = await queryDoH(upstream.server, domain, type, upstream.timeout);
-  if (result.success && result.data) {
-    return { success: true, data: result.data };
+  // 内部捕获异常，统一返回 { success: false }
+  try {
+    const result = await queryDoH(upstream.server, domain, type, upstream.timeout);
+    if (result.success && result.data) {
+      return { success: true, data: result.data };
+    }
+    return { success: false, data: null };
+  } catch (err) {
+    // 实际上 queryDoH 已捕获，但以防万一
+    console.error(`[ERROR] ${new Date().toISOString()} queryDNS 异常: ${err.message}`);
+    return { success: false, data: null };
   }
-  return { success: false, data: null };
 }
 
 async function queryWithFallback(domain, type, retryCount = 0) {
   const maxRetries = upstreams.length;
   const upstream = getCurrentUpstream();
 
-  try {
-    const result = await queryDNS(upstream, domain, type);
-    if (result.success && result.data && (result.data.Answer?.length > 0)) {
-      return { success: true, data: result.data, upstream: upstream.displayName };
-    }
-  } catch (err) {
-    console.log(`${upstream.displayName} 查询失败: ${err.message}`);
+  const result = await queryDNS(upstream, domain, type);
+  if (result.success && result.data && (result.data.Answer?.length > 0)) {
+    return { success: true, data: result.data, upstream: upstream.displayName };
   }
 
   if (retryCount < maxRetries) {
@@ -231,14 +272,16 @@ async function queryAllTypes(domain) {
   const types = ['A', 'AAAA', 'MX', 'TXT', 'NS', 'CNAME'];
   const results = {};
 
-  for (const type of types) {
+  // 并行查询所有类型
+  const promises = types.map(async (type) => {
     const result = await queryWithFallback(domain, type);
-    if (result.success && result.data) {
-      results[type] = result.data.Answer || [];
-      if (!results.upstream) results.upstream = result.upstream;
-    } else {
-      results[type] = [];
-    }
+    return { type, records: result.success ? (result.data.Answer || []) : [], upstream: result.upstream };
+  });
+
+  const allResults = await Promise.all(promises);
+  for (const { type, records, upstream } of allResults) {
+    results[type] = records;
+    if (upstream && !results.upstream) results.upstream = upstream;
   }
 
   return results;
@@ -291,6 +334,89 @@ function setJsonHeaders(res) {
   res.set('Expires', '0');
 }
 
+// ============ 解析请求参数（复用） ============
+function parseDnsRequest(req) {
+  const contentType = req.headers['content-type'] || '';
+  const accept = req.headers['accept'] || '';
+  let domain = null;
+  let type = 'A';
+  let wireBody = null;
+
+  // GET 请求从 query 解析
+  if (req.method === 'GET') {
+    const url = new URL(req.url, `http://${req.headers.host}`);
+    if (url.searchParams.has('name')) {
+      domain = url.searchParams.get('name');
+      type = url.searchParams.get('type') || 'A';
+    } else if (url.searchParams.has('dns')) {
+      wireBody = url.searchParams.get('dns');
+    }
+    return { domain, type, wireBody, accept, contentType };
+  }
+
+  // POST 请求
+  if (req.method === 'POST') {
+    const body = req.body;
+    // JSON
+    if (contentType.includes('application/dns-json')) {
+      let jsonBody;
+      if (typeof body === 'object' && body !== null && !Buffer.isBuffer(body)) {
+        jsonBody = body;
+      } else {
+        try {
+          jsonBody = JSON.parse(body.toString());
+        } catch {
+          throw new Error('Invalid JSON body');
+        }
+      }
+      domain = jsonBody.name || jsonBody.domain;
+      type = jsonBody.type || 'A';
+    }
+    // Form
+    else if (contentType.includes('application/x-www-form-urlencoded')) {
+      let params;
+      if (typeof body === 'object' && body !== null) {
+        params = body;
+      } else {
+        try {
+          params = new URLSearchParams(body.toString());
+        } catch {
+          throw new Error('Invalid form data');
+        }
+      }
+      domain = params.name || params.domain;
+      type = params.type || 'A';
+    }
+    // Wire format
+    else if (contentType.includes('application/dns-message')) {
+      wireBody = body; // Buffer
+    }
+    // 尝试推断 JSON
+    else if (typeof body === 'string' && body.trim().startsWith('{')) {
+      try {
+        const json = JSON.parse(body);
+        domain = json.name || json.domain;
+        type = json.type || 'A';
+      } catch {
+        // 忽略
+      }
+    }
+    // 尝试推断 form
+    else if (typeof body === 'string' && body.includes('=')) {
+      try {
+        const params = new URLSearchParams(body);
+        domain = params.get('name') || params.get('domain');
+        type = params.get('type') || 'A';
+      } catch {
+        // 忽略
+      }
+    }
+    return { domain, type, wireBody, accept, contentType };
+  }
+
+  return { domain, type, wireBody, accept, contentType };
+}
+
 // ============ 中间件 ============
 app.use(express.json({ type: 'application/dns-json' }));
 app.use(express.urlencoded({ extended: true }));
@@ -317,6 +443,7 @@ function requireAdmin(req, res, next) {
 
 // ============ 管理员路由 ============
 app.get('/admin/login', (req, res) => {
+  const errorMsg = req.query.error ? escapeHtml(req.query.error) : '';
   const html = `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -398,7 +525,7 @@ app.get('/admin/login', (req, res) => {
 <body>
   <div class="login-card">
     <h1>🔐 管理员登录</h1>
-    ${req.query.error ? '<div class="error">用户名或密码错误</div>' : ''}
+    ${errorMsg ? `<div class="error">${errorMsg}</div>` : ''}
     <form method="POST" action="/admin/login">
       <div class="input-group">
         <label>用户名</label>
@@ -423,7 +550,7 @@ app.post('/admin/login', (req, res) => {
     req.session.isAdmin = true;
     res.redirect('/admin');
   } else {
-    res.redirect('/admin/login?error=1');
+    res.redirect('/admin/login?error=' + encodeURIComponent('用户名或密码错误'));
   }
 });
 
@@ -433,7 +560,7 @@ app.get('/admin/logout', (req, res) => {
 });
 
 app.get('/admin', requireAdmin, (req, res) => {
-  const hostname = req.headers.host;
+  const hostname = req.headers.host || '';
   const protocol = req.headers['x-forwarded-proto'] || 'https';
   const currentDohUrl = `${protocol}://${hostname}/${DoH路径}`;
   const homeUrl = `${protocol}://${hostname}/`;
@@ -593,10 +720,10 @@ app.get('/admin', requireAdmin, (req, res) => {
     <div class="header">
       <h1>🔧 管理员面板</h1>
       <div class="header-buttons">
-        <a href="${homeUrl}" class="home-btn">
+        <a href="${escapeHtml(homeUrl)}" class="home-btn">
           🏠 返回前台
         </a>
-        <a href="${logoutUrl}" class="logout-btn" onclick="return confirm('确定要退出登录吗？')">
+        <a href="${escapeHtml(logoutUrl)}" class="logout-btn" onclick="return confirm('确定要退出登录吗？')">
           🚪 退出登录
         </a>
       </div>
@@ -633,7 +760,7 @@ app.get('/admin', requireAdmin, (req, res) => {
   </div>
 
   <script>
-    const endpoint = '${currentDohUrl}';
+    const endpoint = '${escapeHtml(currentDohUrl)}';
     document.getElementById('endpoint').innerHTML = endpoint;
 
     let currentMode = 'auto';
@@ -785,7 +912,7 @@ app.post('/api/switch/:id', requireAdmin, (req, res) => {
   if (upstream && upstream.status === 'online') {
     selectedUpstreamId = id;
     currentUpstreamIndex = 0;
-    console.log(`🔧 手动切换到: ${upstream.displayName}`);
+    console.log(`[INFO] ${new Date().toISOString()} 🔧 手动切换到: ${upstream.displayName}`);
     res.json({ success: true, upstream: upstream.displayName });
   } else {
     res.json({ success: false, message: '上游不可用' });
@@ -795,7 +922,7 @@ app.post('/api/switch/:id', requireAdmin, (req, res) => {
 app.post('/api/auto', requireAdmin, (req, res) => {
   selectedUpstreamId = null;
   currentUpstreamIndex = 0;
-  console.log(`🔧 切换到自动模式`);
+  console.log(`[INFO] ${new Date().toISOString()} 🔧 切换到自动模式`);
   res.json({ success: true, mode: 'auto' });
 });
 
@@ -848,228 +975,47 @@ app.get('/api/dns', async (req, res) => {
   }
 });
 
-// ============ DoH 端点 ============
+// ============ DoH 端点（核心 - 已修复 POST wire format） ============
 app.all(`/${DoH路径}`, async (req, res) => {
   const { method, headers, body } = req;
   const UA = headers['user-agent'] || 'DoH Client';
   const accept = headers['accept'] || '';
-  const contentType = headers['content-type'] || '';
 
   try {
-    const upstream = getCurrentUpstream();
-    let domain = null;
-    let type = 'A';
-    let response = null;
+    // 解析请求
+    let { domain, type, wireBody, contentType } = parseDnsRequest(req);
 
-    async function tryMultipleDoHEndpoints(endpoints, requestUrl, options) {
-      let lastError = null;
-      for (const endpoint of endpoints) {
-        try {
-          const fullUrl = requestUrl ? `${endpoint}${requestUrl}` : endpoint;
-          const resp = await fetch(fullUrl, options);
-          if (resp.ok) return resp;
-          lastError = new Error(`HTTP ${resp.status}`);
-        } catch (err) {
-          lastError = err;
-        }
-      }
-      throw lastError || new Error('所有 DoH 端点均失败');
-    }
+    // 如果是 wire 格式（GET ?dns= 或 POST dns-message）
+    if (wireBody !== null) {
+      // 获取所有在线上游的端点
+      const endpoints = upstreams.filter(u => u.status === 'online').map(u => u.server);
+      if (endpoints.length === 0) endpoints.push(upstreams[0].server);
 
-    if (method === 'GET') {
-      const url = new URL(req.url, `http://${req.headers.host}`);
+      let options = {
+        headers: { 'User-Agent': UA }
+      };
+      let targetUrls;
 
-      if (url.searchParams.has('name')) {
-        domain = url.searchParams.get('name');
-        type = url.searchParams.get('type') || 'A';
-
-        if (accept.includes('application/dns-message')) {
-          const endpoints = upstreams.filter(u => u.status === 'online').map(u => u.server);
-          if (endpoints.length === 0) endpoints.push(upstream.server);
-          const queryString = `?name=${encodeURIComponent(domain)}&type=${encodeURIComponent(type)}`;
-          const wireResponse = await tryMultipleDoHEndpoints(
-            endpoints,
-            queryString,
-            { headers: { 'Accept': 'application/dns-message', 'User-Agent': UA } }
-          );
-          const arrayBuffer = await wireResponse.arrayBuffer();
-          const wireBody = Buffer.from(arrayBuffer);
-          res.set('Content-Type', 'application/dns-message');
-          res.set('Content-Length', wireBody.length);
-          res.set('Access-Control-Allow-Origin', '*');
-          return res.status(wireResponse.status).send(wireBody);
-        }
-
-        const result = await queryDNS(upstream, domain, type);
-        if (result.success && result.data) {
-          const formatted = formatDNSResponse(result.data, domain, type);
-          setJsonHeaders(res);
-          return res.json(formatted);
-        } else {
-          setJsonHeaders(res);
-          return res.status(500).json({
-            Status: 2,
-            Answer: [],
-            error: 'DNS 查询失败',
-            code: 'QUERY_FAILED'
-          });
-        }
+      if (method === 'GET') {
+        // GET 方式：wireBody 是字符串（来自 ?dns= 参数）
+        const queryString = `?dns=${encodeURIComponent(wireBody)}`;
+        targetUrls = endpoints.map(e => e + queryString);
+        options.method = 'GET';
+        options.headers['Accept'] = 'application/dns-message';
+      } else if (method === 'POST') {
+        // POST 方式：wireBody 是原始 Buffer（来自 application/dns-message body）
+        targetUrls = endpoints; // 直接 POST 到上游端点，不带查询参数
+        options.method = 'POST';
+        options.headers['Content-Type'] = 'application/dns-message';
+        options.headers['Accept'] = 'application/dns-message';
+        options.body = wireBody; // 原始 Buffer
+      } else {
+        throw new Error('不支持的请求方法');
       }
 
-      if (url.searchParams.has('dns')) {
-        const endpoints = upstreams.filter(u => u.status === 'online').map(u => u.server);
-        if (endpoints.length === 0) endpoints.push(upstream.server);
-        const base64url = url.searchParams.get('dns');
-        const queryString = `?dns=${encodeURIComponent(base64url)}`;
-        const wireResponse = await tryMultipleDoHEndpoints(
-          endpoints,
-          queryString,
-          { headers: { 'Accept': 'application/dns-message', 'User-Agent': UA } }
-        );
-        const arrayBuffer = await wireResponse.arrayBuffer();
-        const wireBody = Buffer.from(arrayBuffer);
-        res.set('Content-Type', 'application/dns-message');
-        res.set('Content-Length', wireBody.length);
-        res.set('Access-Control-Allow-Origin', '*');
-        return res.status(wireResponse.status).send(wireBody);
-      }
+      // 使用通用 fallback 函数尝试所有上游
+      const response = await fetchWithFallback(targetUrls, options, 10000);
 
-      setJsonHeaders(res);
-      return res.status(400).json({ error: '缺少参数 name 或 dns' });
-    }
-
-    else if (method === 'POST') {
-      let rawBody = '';
-      if (Buffer.isBuffer(body)) {
-        rawBody = body.toString('utf8');
-      } else if (typeof body === 'string') {
-        rawBody = body;
-      } else if (body && typeof body === 'object') {
-        rawBody = JSON.stringify(body);
-      }
-
-      if (contentType.includes('application/dns-json')) {
-        try {
-          let jsonBody;
-          if (typeof body === 'object' && body !== null && !Buffer.isBuffer(body)) {
-            jsonBody = body;
-          } else {
-            jsonBody = JSON.parse(rawBody);
-          }
-          domain = jsonBody.name || jsonBody.domain;
-          type = jsonBody.type || 'A';
-        } catch (e) {
-          setJsonHeaders(res);
-          return res.status(400).json({ error: '无效的 JSON 格式', message: e.message });
-        }
-      } else if (contentType.includes('application/x-www-form-urlencoded')) {
-        try {
-          if (req.body && typeof req.body === 'object' && Object.keys(req.body).length > 0) {
-            domain = req.body.name || req.body.domain;
-            type = req.body.type || 'A';
-          } else if (rawBody) {
-            const params = new URLSearchParams(rawBody);
-            domain = params.get('name') || params.get('domain');
-            type = params.get('type') || 'A';
-          }
-        } catch (e) {
-          setJsonHeaders(res);
-          return res.status(400).json({ error: '无效的表单格式' });
-        }
-      } else if (contentType.includes('application/dns-message')) {
-        const endpoints = upstreams.filter(u => u.status === 'online').map(u => u.server);
-        if (endpoints.length === 0) endpoints.push(upstream.server);
-        const options = {
-          method: 'POST',
-          headers: {
-            'Accept': 'application/dns-message',
-            'Content-Type': 'application/dns-message',
-            'User-Agent': UA
-          },
-          body: body
-        };
-        let lastError = null;
-        for (const endpoint of endpoints) {
-          try {
-            const resp = await fetch(endpoint, options);
-            if (resp.ok) {
-              response = resp;
-              break;
-            }
-            lastError = new Error(`HTTP ${resp.status}`);
-          } catch (err) {
-            lastError = err;
-          }
-        }
-        if (!response) {
-          throw lastError || new Error('所有 DoH POST 失败');
-        }
-      } else if (rawBody.trim().startsWith('{')) {
-        try {
-          const jsonBody = JSON.parse(rawBody);
-          domain = jsonBody.name || jsonBody.domain;
-          type = jsonBody.type || 'A';
-        } catch (e) {
-          setJsonHeaders(res);
-          return res.status(400).json({ error: '无法解析 JSON 请求体' });
-        }
-      } else if (rawBody.includes('=')) {
-        try {
-          const params = new URLSearchParams(rawBody);
-          domain = params.get('name') || params.get('domain');
-          type = params.get('type') || 'A';
-        } catch (e) {
-          setJsonHeaders(res);
-          return res.status(400).json({ error: '无法解析表单请求体' });
-        }
-      }
-
-      if (domain && !response) {
-        if (accept.includes('application/dns-message')) {
-          const endpoints = upstreams.filter(u => u.status === 'online').map(u => u.server);
-          if (endpoints.length === 0) endpoints.push(upstream.server);
-          const queryString = `?name=${encodeURIComponent(domain)}&type=${encodeURIComponent(type)}`;
-          const wireResponse = await tryMultipleDoHEndpoints(
-            endpoints,
-            queryString,
-            { headers: { 'Accept': 'application/dns-message', 'User-Agent': UA } }
-          );
-          const arrayBuffer = await wireResponse.arrayBuffer();
-          const wireBody = Buffer.from(arrayBuffer);
-          res.set('Content-Type', 'application/dns-message');
-          res.set('Content-Length', wireBody.length);
-          res.set('Access-Control-Allow-Origin', '*');
-          return res.status(wireResponse.status).send(wireBody);
-        }
-
-        const result = await queryDNS(upstream, domain, type);
-        if (result.success && result.data) {
-          const formatted = formatDNSResponse(result.data, domain, type);
-          setJsonHeaders(res);
-          return res.json(formatted);
-        } else {
-          setJsonHeaders(res);
-          return res.status(500).json({
-            Status: 2,
-            Answer: [],
-            error: 'DNS 查询失败',
-            code: 'QUERY_FAILED'
-          });
-        }
-      }
-
-      if (!domain && !response) {
-        setJsonHeaders(res);
-        return res.status(400).json({
-          error: '无法解析请求',
-          message: '请确保请求包含 name 或 domain 参数',
-          contentType: contentType
-        });
-      }
-    }
-
-    if (response) {
-      if (!response.ok) throw new Error(`DoH 返回错误 (${response.status})`);
       const arrayBuffer = await response.arrayBuffer();
       const responseBody = Buffer.from(arrayBuffer);
       res.set('Content-Type', 'application/dns-message');
@@ -1078,11 +1024,30 @@ app.all(`/${DoH路径}`, async (req, res) => {
       return res.status(response.status).send(responseBody);
     }
 
-    setJsonHeaders(res);
-    return res.status(400).json({ error: '不支持的请求格式' });
+    // 非 wire 格式：必须是 JSON 查询，必须有 domain
+    if (!domain) {
+      setJsonHeaders(res);
+      return res.status(400).json({ error: '缺少 name 或 domain 参数' });
+    }
+
+    // 使用带故障转移的查询
+    const result = await queryWithFallback(domain, type);
+    if (result.success && result.data) {
+      const formatted = formatDNSResponse(result.data, domain, type);
+      setJsonHeaders(res);
+      return res.json(formatted);
+    } else {
+      setJsonHeaders(res);
+      return res.status(500).json({
+        Status: 2,
+        Answer: [],
+        error: 'DNS 查询失败（所有上游均不可用）',
+        code: 'QUERY_FAILED'
+      });
+    }
 
   } catch (error) {
-    console.error("DoH 请求处理错误:", error);
+    console.error(`[ERROR] ${new Date().toISOString()} DoH 请求处理错误:`, error);
     setJsonHeaders(res);
     res.status(500).json({ error: '内部服务器错误', message: error.message, code: 'INTERNAL_ERROR' });
   }
@@ -1090,7 +1055,7 @@ app.all(`/${DoH路径}`, async (req, res) => {
 
 // ============ 公开首页 ============
 app.get('/', (req, res) => {
-  const hostname = req.headers.host;
+  const hostname = req.headers.host || '';
   const protocol = req.headers['x-forwarded-proto'] || 'https';
   const currentDohUrl = `${protocol}://${hostname}/${DoH路径}`;
   const adminUrl = `${protocol}://${hostname}/admin`;
@@ -1308,7 +1273,7 @@ app.get('/', (req, res) => {
     <div class="header">
       <h1>🖥️ DNS over HTTPS Server</h1>
       <div class="header-sub">
-        <a href="${adminUrl}" class="login-btn">
+        <a href="${escapeHtml(adminUrl)}" class="login-btn">
           🔐 管理员登录
         </a>
       </div>
@@ -1355,11 +1320,11 @@ app.get('/', (req, res) => {
       <div id="result" class="result"></div>
     </div>
 
-    <!-- ========== 完整的“使用示例”卡片（简洁风格） ========== -->
+    <!-- ========== 使用示例 ========== -->
     <div class="card">
       <h2>📖 使用示例</h2>
       <div style="font-size:14px; margin-bottom:12px; color:#555;">
-        以下命令中的端点 <code>${currentDohUrl}</code> 已自动替换为您的实际地址，可直接复制运行。
+        以下命令中的端点 <code>${escapeHtml(currentDohUrl)}</code> 已自动替换为您的实际地址，可直接复制运行。
       </div>
 
       <!-- 1. GET JSON -->
@@ -1367,15 +1332,15 @@ app.get('/', (req, res) => {
         <div style="font-weight:bold; color:#667eea;">1️⃣ GET 请求 – JSON 格式（?name=）</div>
         <div class="curl-example"># A 记录 (IPv4)
 curl -H "accept: application/dns-json" \\
-  "${currentDohUrl}?name=google.com&type=A"
+  "${escapeHtml(currentDohUrl)}?name=google.com&type=A"
 
 # AAAA 记录 (IPv6)
 curl -H "accept: application/dns-json" \\
-  "${currentDohUrl}?name=google.com&type=AAAA"
+  "${escapeHtml(currentDohUrl)}?name=google.com&type=AAAA"
 
 # HTTPS 记录 (ECH 配置)
 curl -H "accept: application/dns-json" \\
-  "${currentDohUrl}?name=cloudflare-ech.com&type=HTTPS"</div>
+  "${escapeHtml(currentDohUrl)}?name=cloudflare-ech.com&type=HTTPS"</div>
         <div style="font-size:13px; color:#666;">预期：返回 JSON，Answer 中包含对应记录。</div>
       </div>
 
@@ -1384,7 +1349,7 @@ curl -H "accept: application/dns-json" \\
         <div style="font-weight:bold; color:#667eea;">2️⃣ GET 请求 – Wire Format（?dns=）</div>
         <div class="curl-example"># 查询 google.com A 记录（Base64URL 编码示例）
 curl -H "accept: application/dns-message" \\
-  "${currentDohUrl}?dns=AAABAAABAAAAAAAAB2V4YW1wbGUDY29tAAABAAE"</div>
+  "${escapeHtml(currentDohUrl)}?dns=AAABAAABAAAAAAAAB2V4YW1wbGUDY29tAAABAAE"</div>
         <div style="font-size:13px; color:#666;">
           预期：返回二进制 DNS 数据（终端会显示乱码，这是正常的）。<br>
           验证响应头：<code>content-type: application/dns-message</code>
@@ -1397,12 +1362,12 @@ curl -H "accept: application/dns-message" \\
         <div class="curl-example"># A 记录查询
 curl -X POST -H "Content-Type: application/dns-json" \\
   -d '{"name":"google.com","type":"A"}' \\
-  "${currentDohUrl}"
+  "${escapeHtml(currentDohUrl)}"
 
 # HTTPS 记录查询
 curl -X POST -H "Content-Type: application/dns-json" \\
   -d '{"name":"cloudflare-ech.com","type":"HTTPS"}' \\
-  "${currentDohUrl}"</div>
+  "${escapeHtml(currentDohUrl)}"</div>
         <div style="font-size:13px; color:#666;">预期：返回 JSON，Answer 中包含记录。</div>
       </div>
 
@@ -1411,17 +1376,17 @@ curl -X POST -H "Content-Type: application/dns-json" \\
         <div style="font-weight:bold; color:#667eea;">4️⃣ POST 请求 – 表单格式</div>
         <div class="curl-example">curl -X POST -H "Content-Type: application/x-www-form-urlencoded" \\
   -d "name=google.com&type=A" \\
-  "${currentDohUrl}"</div>
+  "${escapeHtml(currentDohUrl)}"</div>
         <div style="font-size:13px; color:#666;">预期：返回 JSON，Answer 中包含 IPv4 地址。</div>
       </div>
 
-      <!-- 5. POST Wire Format -->
+      <!-- 5. POST Wire Format（已修复样式包裹） -->
       <div style="margin-bottom:16px; border-left:3px solid #667eea; padding-left:12px;">
-        <div style="font-weight:bold; color:#667eea;">5️⃣ POST 请求 – Wire Format（原始二进制）
-# 发送二进制数据
+        <div style="font-weight:bold; color:#667eea;">5️⃣ POST 请求 – Wire Format（原始二进制）</div>
+        <div class="curl-example"># 发送二进制数据
 echo -n "AAABAAABAAAAAAAAB2V4YW1wbGUDY29tAAABAAE" | base64 -d > query.bin
 curl -X POST -H "Content-Type: application/dns-message" --data-binary @query.bin \\
-  "${currentDohUrl}"</div>
+  "${escapeHtml(currentDohUrl)}"</div>
         <div style="font-size:13px; color:#666;">
           预期：返回二进制 DNS 响应（终端显示乱码）。<br>
           验证响应头：<code>content-type: application/dns-message</code>
@@ -1433,11 +1398,11 @@ curl -X POST -H "Content-Type: application/dns-message" --data-binary @query.bin
         <div style="font-weight:bold; color:#667eea;">🌐 浏览器访问 & 配置 DoH</div>
         <div class="curl-example" style="background:#f0f0f0; color:#333;">
           # 浏览器直接访问（显示 JSON）
-          <a href="${currentDohUrl}?name=google.com&type=A" target="_blank">${currentDohUrl}?name=google.com&type=A</a>
+          <a href="${escapeHtml(currentDohUrl)}?name=google.com&type=A" target="_blank">${escapeHtml(currentDohUrl)}?name=google.com&type=A</a>
 
           # Chrome/Edge 配置 DoH
           设置 → 隐私和安全 → 安全 → 使用安全 DNS → 自定义
-          填入：<strong>${currentDohUrl}</strong>
+          填入：<strong>${escapeHtml(currentDohUrl)}</strong>
         </div>
       </div>
 
@@ -1446,15 +1411,15 @@ curl -X POST -H "Content-Type: application/dns-message" --data-binary @query.bin
         <div style="font-weight:bold; color:#667eea;">🔍 诊断辅助命令</div>
         <div class="curl-example" style="background:#f0f0f0; color:#333;">
 # 查看完整响应头（确认 Content-Type）
-curl -I "${currentDohUrl}?name=google.com&type=A"
+curl -I "${escapeHtml(currentDohUrl)}?name=google.com&type=A"
 
 # 查看 wire format 响应头
 curl -I -H "accept: application/dns-message" \\
-  "${currentDohUrl}?dns=AAABAAABAAAAAAAAB2V4YW1wbGUDY29tAAABAAE"
+  "${escapeHtml(currentDohUrl)}?dns=AAABAAABAAAAAAAAB2V4YW1wbGUDY29tAAABAAE"
 
 # 保存 wire format 响应到文件（避免终端乱码）
 curl -H "accept: application/dns-message" \\
-  "${currentDohUrl}?dns=AAABAAABAAAAAAAAB2V4YW1wbGUDY29tAAABAAE" \\
+  "${escapeHtml(currentDohUrl)}?dns=AAABAAABAAAAAAAAB2V4YW1wbGUDY29tAAABAAE" \\
   --output response.bin
 </div>
       </div>
@@ -1466,7 +1431,7 @@ curl -H "accept: application/dns-message" \\
   </div>
 
   <script>
-    const endpoint = '${currentDohUrl}';
+    const endpoint = '${escapeHtml(currentDohUrl)}';
     document.getElementById('endpoint').innerHTML = endpoint;
 
     async function loadUpstreams() {
@@ -1638,22 +1603,22 @@ app.get('/health', (req, res) => {
   });
 });
 
-// 启动服务器
+// ============ 启动服务器 ============
 app.listen(PORT, '0.0.0.0', async () => {
-  console.log(`========================================`);
-  console.log(`🛡️ 纯 DoH 服务器已启动`);
-  console.log(`📡 端口: ${PORT}`);
-  console.log(`🔗 DoH 端点: /${DoH路径}`);
-  console.log(`🔐 管理员入口: /admin`);
-  console.log(`📋 默认账号: ${ADMIN_USER} / ${ADMIN_PASS}`);
-  console.log(`🌐 DoH 上游总数: ${upstreams.length}`);
-  console.log(`========================================`);
+  console.log(`[INFO] ${new Date().toISOString()} ========================================`);
+  console.log(`[INFO] ${new Date().toISOString()} 🛡️ 纯 DoH 服务器已启动`);
+  console.log(`[INFO] ${new Date().toISOString()} 📡 端口: ${PORT}`);
+  console.log(`[INFO] ${new Date().toISOString()} 🔗 DoH 端点: /${DoH路径}`);
+  console.log(`[INFO] ${new Date().toISOString()} 🔐 管理员入口: /admin`);
+  console.log(`[INFO] ${new Date().toISOString()} 📋 默认账号: ${ADMIN_USER} / ${ADMIN_PASS}`);
+  console.log(`[INFO] ${new Date().toISOString()} 🌐 DoH 上游总数: ${upstreams.length}`);
+  console.log(`[INFO] ${new Date().toISOString()} ========================================`);
 
   await healthCheck();
   setInterval(healthCheck, 60000);
 });
 
 process.on('SIGTERM', () => {
-  console.log('正在关闭...');
+  console.log(`[INFO] ${new Date().toISOString()} 正在关闭...`);
   process.exit(0);
 });
