@@ -9,35 +9,30 @@ const ADMIN_USER = process.env.ADMIN_USER || 'admin';
 const ADMIN_PASS = process.env.ADMIN_PASS || '123321';
 const SESSION_SECRET = process.env.SESSION_SECRET || 'doh-server-secret-key';
 
-// ============ Session 配置（HF Spaces 适用） ============
+// ============ Session 配置 ============
 app.use(session({
   secret: SESSION_SECRET,
   resave: false,
   saveUninitialized: false,
   cookie: {
-    secure: false,          // 必须为 false，因为 Spaces 内部是 HTTP
+    secure: false,
     maxAge: 24 * 60 * 60 * 1000,
     httpOnly: true,
     sameSite: 'lax'
   }
 }));
 
-// ============ DoH 路径配置（规范化） ============
+// ============ DoH 路径配置 ============
 let DoH路径 = process.env.DOH_PATH || process.env.TOKEN || 'dns-query';
-
-// 去除首尾斜杠
 DoH路径 = DoH路径.replace(/^\/+|\/+$/g, '');
-// 如果包含斜杠，取最后一段
 if (DoH路径.includes('/')) {
   const parts = DoH路径.split('/');
   DoH路径 = parts[parts.length - 1];
 }
-// 只允许安全字符（字母、数字、连字符、下划线）
 DoH路径 = DoH路径.replace(/[^a-zA-Z0-9\-_]/g, '');
 if (!DoH路径 || DoH路径.length === 0) {
   DoH路径 = 'dns-query';
 }
-
 console.log(`[INFO] ${new Date().toISOString()} 📡 DoH 端点路径: /${DoH路径}`);
 
 // ============ DNS 记录类型映射 ============
@@ -46,7 +41,7 @@ const recordTypeMap = {
   'SOA': 6, 'PTR': 12, 'SRV': 33, 'CAA': 257, 'HTTPS': 65, 'ANY': 255
 };
 
-// ============ 仅 DoH 上游配置 ============
+// ============ 上游配置 ============
 const upstreamsConfig = [
   { name: "cloudflare-dns.com", display: "Cloudflare", server: "https://cloudflare-dns.com/dns-query", region: "全球", type: "DoH", priority: 1 },
   { name: "dns.google", display: "Google", server: "https://dns.google/dns-query", region: "全球", type: "DoH", priority: 2 },
@@ -61,7 +56,6 @@ const upstreamsConfig = [
 
 const enabledUpstreamsEnv = process.env.ENABLED_UPSTREAMS || 'all';
 let upstreamList = [];
-
 if (enabledUpstreamsEnv === 'all') {
   upstreamList = upstreamsConfig;
 } else {
@@ -72,7 +66,6 @@ if (enabledUpstreamsEnv === 'all') {
   if (upstreamList.length === 0) upstreamList = upstreamsConfig.slice(0, 5);
 }
 
-// 构建上游对象
 const upstreams = upstreamList.map((config, index) => ({
   id: index,
   name: config.name,
@@ -91,11 +84,16 @@ console.log(`[INFO] ${new Date().toISOString()} 📋 上游列表: ${upstreams.m
 
 let selectedUpstreamId = null;
 let availableUpstreams = [...upstreams];
-let sortedAvailable = [];          // 预排序缓存（按响应时间升序）
+let sortedAvailable = [];
 let currentUpstreamIndex = 0;
 let healthCheckRunning = false;
 
-// ============ 辅助函数：HTML 转义（防 XSS） ============
+// ============ 服务端地理信息缓存 ============
+const geoCache = new Map();
+const GEO_CACHE_TTL = 7 * 24 * 60 * 60 * 1000;        // 7 天
+const GEO_FAIL_TTL = 60 * 60 * 1000;                  // 1 小时
+
+// ============ 辅助函数 ============
 function escapeHtml(str) {
   if (!str) return '';
   return String(str)
@@ -120,12 +118,10 @@ async function checkSingleUpstream(upstream) {
       signal: controller.signal
     });
     clearTimeout(timeoutId);
-
     const isOnline = response.ok;
     upstream.status = isOnline ? 'online' : 'offline';
     upstream.lastCheck = new Date().toISOString();
     upstream.responseTime = isOnline ? Date.now() - startTime : null;
-
     if (isOnline) {
       console.log(`[INFO] ${new Date().toISOString()} ✅ ${upstream.displayName} - ${upstream.responseTime}ms`);
     } else {
@@ -144,29 +140,20 @@ async function checkSingleUpstream(upstream) {
 async function healthCheck() {
   if (healthCheckRunning) return;
   healthCheckRunning = true;
-
   console.log(`[INFO] ${new Date().toISOString()} 🔍 开始健康检查`);
-
-  // 并行检查所有上游
   await Promise.all(upstreams.map(u => checkSingleUpstream(u)));
-
-  // 构建新的可用列表，并排序（避免并发修改）
   const newAvailable = upstreams.filter(u => u.status === 'online');
   newAvailable.sort((a, b) => (a.responseTime || 9999) - (b.responseTime || 9999));
-
-  // 原子更新
   availableUpstreams = newAvailable;
-  sortedAvailable = [...availableUpstreams];  // 已排序
-
+  sortedAvailable = [...availableUpstreams];
   console.log(`[INFO] ${new Date().toISOString()} 📡 在线: ${availableUpstreams.length}/${upstreams.length}`);
   if (availableUpstreams[0]) {
     console.log(`[INFO] ${new Date().toISOString()} 📡 最快: ${availableUpstreams[0].displayName} (${availableUpstreams[0].responseTime}ms)`);
   }
-
   healthCheckRunning = false;
 }
 
-// ============ 获取当前上游（使用预排序缓存） ============
+// ============ 获取当前上游（自动模式始终用最快的） ============
 function getCurrentUpstream() {
   if (selectedUpstreamId !== null) {
     const selected = upstreams.find(u => u.id === selectedUpstreamId);
@@ -175,31 +162,22 @@ function getCurrentUpstream() {
     }
     selectedUpstreamId = null;
   }
-
-  // 从排序缓存中轮询
   if (sortedAvailable.length > 0) {
-    const upstream = sortedAvailable[currentUpstreamIndex % sortedAvailable.length];
-    currentUpstreamIndex++;
-    return upstream;
+    return sortedAvailable[0];
   }
-
-  // 降级：返回第一个（即使 offline）
   return upstreams[0];
 }
 
-// ============ 通用 fetch 重试函数（带 fallback） ============
 async function fetchWithFallback(endpoints, options, timeout = 10000) {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), timeout);
   const signal = controller.signal;
-
   let lastError = null;
   for (const endpoint of endpoints) {
     try {
       const response = await fetch(endpoint, { ...options, signal });
       clearTimeout(timeoutId);
       if (response.ok) return response;
-      // 非 2xx 状态，继续尝试下一个
       lastError = new Error(`HTTP ${response.status}`);
     } catch (err) {
       lastError = err;
@@ -209,22 +187,18 @@ async function fetchWithFallback(endpoints, options, timeout = 10000) {
   throw lastError || new Error('所有上游均失败');
 }
 
-// ============ 核心查询函数 ============
 async function queryDoH(server, domain, type, timeout = 10000) {
   const url = new URL(server);
   url.searchParams.set("name", domain);
   url.searchParams.set("type", type);
-
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), timeout);
-
   try {
     const response = await fetch(url.toString(), {
       headers: { 'Accept': 'application/dns-json' },
       signal: controller.signal
     });
     clearTimeout(timeoutId);
-
     if (response.ok) {
       const data = await response.json();
       return { success: true, data };
@@ -238,7 +212,6 @@ async function queryDoH(server, domain, type, timeout = 10000) {
 }
 
 async function queryDNS(upstream, domain, type) {
-  // 内部捕获异常，统一返回 { success: false }
   try {
     const result = await queryDoH(upstream.server, domain, type, upstream.timeout);
     if (result.success && result.data) {
@@ -246,7 +219,6 @@ async function queryDNS(upstream, domain, type) {
     }
     return { success: false, data: null };
   } catch (err) {
-    // 实际上 queryDoH 已捕获，但以防万一
     console.error(`[ERROR] ${new Date().toISOString()} queryDNS 异常: ${err.message}`);
     return { success: false, data: null };
   }
@@ -255,35 +227,28 @@ async function queryDNS(upstream, domain, type) {
 async function queryWithFallback(domain, type, retryCount = 0) {
   const maxRetries = upstreams.length;
   const upstream = getCurrentUpstream();
-
   const result = await queryDNS(upstream, domain, type);
   if (result.success && result.data && (result.data.Answer?.length > 0)) {
     return { success: true, data: result.data, upstream: upstream.displayName };
   }
-
   if (retryCount < maxRetries) {
     return queryWithFallback(domain, type, retryCount + 1);
   }
-
   return { success: false, data: null, upstream: null };
 }
 
 async function queryAllTypes(domain) {
   const types = ['A', 'AAAA', 'MX', 'TXT', 'NS', 'CNAME'];
   const results = {};
-
-  // 并行查询所有类型
   const promises = types.map(async (type) => {
     const result = await queryWithFallback(domain, type);
     return { type, records: result.success ? (result.data.Answer || []) : [], upstream: result.upstream };
   });
-
   const allResults = await Promise.all(promises);
   for (const { type, records, upstream } of allResults) {
     results[type] = records;
     if (upstream && !results.upstream) results.upstream = upstream;
   }
-
   return results;
 }
 
@@ -308,7 +273,6 @@ function getCurrentStatus() {
   };
 }
 
-// ============ 辅助函数 ============
 function formatDNSResponse(data, domain, type) {
   if (data.Status !== undefined || data.Status === 0) {
     return data;
@@ -334,15 +298,12 @@ function setJsonHeaders(res) {
   res.set('Expires', '0');
 }
 
-// ============ 解析请求参数（复用） ============
 function parseDnsRequest(req) {
   const contentType = req.headers['content-type'] || '';
   const accept = req.headers['accept'] || '';
   let domain = null;
   let type = 'A';
   let wireBody = null;
-
-  // GET 请求从 query 解析
   if (req.method === 'GET') {
     const url = new URL(req.url, `http://${req.headers.host}`);
     if (url.searchParams.has('name')) {
@@ -353,11 +314,8 @@ function parseDnsRequest(req) {
     }
     return { domain, type, wireBody, accept, contentType };
   }
-
-  // POST 请求
   if (req.method === 'POST') {
     const body = req.body;
-    // JSON
     if (contentType.includes('application/dns-json')) {
       let jsonBody;
       if (typeof body === 'object' && body !== null && !Buffer.isBuffer(body)) {
@@ -371,9 +329,7 @@ function parseDnsRequest(req) {
       }
       domain = jsonBody.name || jsonBody.domain;
       type = jsonBody.type || 'A';
-    }
-    // Form
-    else if (contentType.includes('application/x-www-form-urlencoded')) {
+    } else if (contentType.includes('application/x-www-form-urlencoded')) {
       let params;
       if (typeof body === 'object' && body !== null) {
         params = body;
@@ -386,35 +342,111 @@ function parseDnsRequest(req) {
       }
       domain = params.name || params.domain;
       type = params.type || 'A';
-    }
-    // Wire format
-    else if (contentType.includes('application/dns-message')) {
-      wireBody = body; // Buffer
-    }
-    // 尝试推断 JSON
-    else if (typeof body === 'string' && body.trim().startsWith('{')) {
+    } else if (contentType.includes('application/dns-message')) {
+      wireBody = body;
+    } else if (typeof body === 'string' && body.trim().startsWith('{')) {
       try {
         const json = JSON.parse(body);
         domain = json.name || json.domain;
         type = json.type || 'A';
-      } catch {
-        // 忽略
-      }
-    }
-    // 尝试推断 form
-    else if (typeof body === 'string' && body.includes('=')) {
+      } catch {}
+    } else if (typeof body === 'string' && body.includes('=')) {
       try {
         const params = new URLSearchParams(body);
         domain = params.get('name') || params.get('domain');
         type = params.get('type') || 'A';
-      } catch {
-        // 忽略
-      }
+      } catch {}
     }
     return { domain, type, wireBody, accept, contentType };
   }
-
   return { domain, type, wireBody, accept, contentType };
+}
+
+// ============ 服务端地理位置增强函数 ============
+async function enrichGeoOnServer(data) {
+  // 收集所有 A/AAAA 记录的 IP
+  const toEnrich = [];
+  const collect = (records) => {
+    if (!records) return;
+    records.forEach((r) => {
+      if (r.data && (r.type === 1 || r.type === 28)) {
+        toEnrich.push({ ip: r.data, ref: r });
+      }
+    });
+  };
+  if (data.Answer) collect(data.Answer);
+  // 如果 data 中有 A/AAAA 单独字段（如 all 查询），也收集
+  ['A', 'AAAA'].forEach(t => {
+    if (data[t]) collect(data[t]);
+  });
+  if (toEnrich.length === 0) return;
+
+  // 去重
+  const uniqueIps = [...new Set(toEnrich.map(item => item.ip))];
+  const now = Date.now();
+  const needQueryIps = uniqueIps.filter(ip => {
+    const cached = geoCache.get(ip);
+    if (cached && cached.expireAt > now) {
+      // 有缓存且未过期，直接应用
+      const items = toEnrich.filter(item => item.ip === ip);
+      items.forEach(item => {
+        if (cached.data && cached.data.status === 'success') {
+          item.ref.geo = cached.data.country + ' ' + cached.data.as;
+        }
+      });
+      return false;
+    }
+    return true;
+  });
+
+  if (needQueryIps.length === 0) return;
+
+  // 分批批量查询（每批最多 100 个）
+  const batchSize = 100;
+  for (let i = 0; i < needQueryIps.length; i += batchSize) {
+    const batchIps = needQueryIps.slice(i, i + batchSize);
+    try {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 3000);
+      const response = await fetch('http://ip-api.com/batch?fields=status,country,as&lang=zh-CN', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(batchIps),
+        signal: controller.signal
+      });
+      clearTimeout(timeoutId);
+      if (!response.ok) throw new Error('Batch API error');
+      const results = await response.json();
+      results.forEach((geo, index) => {
+        const ip = batchIps[index];
+        if (geo && geo.status === 'success') {
+          geoCache.set(ip, {
+            data: geo,
+            expireAt: now + GEO_CACHE_TTL
+          });
+          const items = toEnrich.filter(item => item.ip === ip);
+          items.forEach(item => {
+            item.ref.geo = geo.country + ' ' + geo.as;
+          });
+        } else {
+          // 失败缓存短时间，避免频繁重试
+          geoCache.set(ip, {
+            data: null,
+            expireAt: now + GEO_FAIL_TTL
+          });
+        }
+      });
+    } catch (error) {
+      console.warn('批量查询 IP 地理信息失败:', error);
+      // 网络错误，将这批 IP 缓存失败结果
+      batchIps.forEach(ip => {
+        geoCache.set(ip, {
+          data: null,
+          expireAt: now + 5 * 60 * 1000 // 5 分钟
+        });
+      });
+    }
+  }
 }
 
 // ============ 中间件 ============
@@ -432,7 +464,6 @@ app.use((req, res, next) => {
   next();
 });
 
-// ============ 登录验证中间件 ============
 function requireAdmin(req, res, next) {
   if (req.session && req.session.isAdmin) {
     next();
@@ -565,7 +596,6 @@ app.get('/admin', requireAdmin, (req, res) => {
   const currentDohUrl = `${protocol}://${hostname}/${DoH路径}`;
   const homeUrl = `${protocol}://${hostname}/`;
   const logoutUrl = `${protocol}://${hostname}/admin/logout`;
-
   const html = `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -908,7 +938,6 @@ app.get('/admin', requireAdmin, (req, res) => {
 app.post('/api/switch/:id', requireAdmin, (req, res) => {
   const id = parseInt(req.params.id);
   const upstream = upstreams.find(u => u.id === id);
-
   if (upstream && upstream.status === 'online') {
     selectedUpstreamId = id;
     currentUpstreamIndex = 0;
@@ -935,31 +964,26 @@ app.get('/api/upstreams', (req, res) => {
   res.json(getCurrentStatus());
 });
 
+// ============ /api/dns 增强（服务端地理缓存） ============
 app.get('/api/dns', async (req, res) => {
   const domain = req.query.domain || 'www.google.com';
   const type = req.query.type || 'A';
-
   try {
+    let resultData;
+    let upstreamName;
     if (type === 'all') {
       const results = await queryAllTypes(domain);
-      const formatted = {
+      resultData = {
         Status: 0,
         upstream: results.upstream || 'auto',
         ...results
       };
-      setJsonHeaders(res);
-      return res.json(formatted);
+      upstreamName = results.upstream || 'auto';
+      // 对 A/AAAA 记录进行地理增强
+      await enrichGeoOnServer(resultData);
     } else {
       const result = await queryWithFallback(domain, type);
-      if (result.success) {
-        const formatted = formatDNSResponse(result.data, domain, type);
-        setJsonHeaders(res);
-        return res.json({
-          Status: formatted.Status,
-          upstream: result.upstream,
-          ...formatted
-        });
-      } else {
+      if (!result.success) {
         setJsonHeaders(res);
         return res.status(404).json({
           Status: 2,
@@ -968,54 +992,50 @@ app.get('/api/dns', async (req, res) => {
           error: '查询失败'
         });
       }
+      const formatted = formatDNSResponse(result.data, domain, type);
+      resultData = {
+        Status: formatted.Status,
+        upstream: result.upstream,
+        ...formatted
+      };
+      upstreamName = result.upstream;
+      // 对 A/AAAA 记录进行地理增强
+      await enrichGeoOnServer(resultData);
     }
+    setJsonHeaders(res);
+    res.json(resultData);
   } catch (err) {
     setJsonHeaders(res);
     res.status(500).json({ error: err.message });
   }
 });
 
-// ============ DoH 端点（核心 - 已修复 POST wire format） ============
+// ============ DoH 端点 ============
 app.all(`/${DoH路径}`, async (req, res) => {
   const { method, headers, body } = req;
   const UA = headers['user-agent'] || 'DoH Client';
-  const accept = headers['accept'] || '';
-
   try {
-    // 解析请求
     let { domain, type, wireBody, contentType } = parseDnsRequest(req);
-
-    // 如果是 wire 格式（GET ?dns= 或 POST dns-message）
     if (wireBody !== null) {
-      // 获取所有在线上游的端点
       const endpoints = upstreams.filter(u => u.status === 'online').map(u => u.server);
       if (endpoints.length === 0) endpoints.push(upstreams[0].server);
-
-      let options = {
-        headers: { 'User-Agent': UA }
-      };
+      let options = { headers: { 'User-Agent': UA } };
       let targetUrls;
-
       if (method === 'GET') {
-        // GET 方式：wireBody 是字符串（来自 ?dns= 参数）
         const queryString = `?dns=${encodeURIComponent(wireBody)}`;
         targetUrls = endpoints.map(e => e + queryString);
         options.method = 'GET';
         options.headers['Accept'] = 'application/dns-message';
       } else if (method === 'POST') {
-        // POST 方式：wireBody 是原始 Buffer（来自 application/dns-message body）
-        targetUrls = endpoints; // 直接 POST 到上游端点，不带查询参数
+        targetUrls = endpoints;
         options.method = 'POST';
         options.headers['Content-Type'] = 'application/dns-message';
         options.headers['Accept'] = 'application/dns-message';
-        options.body = wireBody; // 原始 Buffer
+        options.body = wireBody;
       } else {
         throw new Error('不支持的请求方法');
       }
-
-      // 使用通用 fallback 函数尝试所有上游
       const response = await fetchWithFallback(targetUrls, options, 10000);
-
       const arrayBuffer = await response.arrayBuffer();
       const responseBody = Buffer.from(arrayBuffer);
       res.set('Content-Type', 'application/dns-message');
@@ -1023,17 +1043,15 @@ app.all(`/${DoH路径}`, async (req, res) => {
       res.set('Access-Control-Allow-Origin', '*');
       return res.status(response.status).send(responseBody);
     }
-
-    // 非 wire 格式：必须是 JSON 查询，必须有 domain
     if (!domain) {
       setJsonHeaders(res);
       return res.status(400).json({ error: '缺少 name 或 domain 参数' });
     }
-
-    // 使用带故障转移的查询
     const result = await queryWithFallback(domain, type);
     if (result.success && result.data) {
       const formatted = formatDNSResponse(result.data, domain, type);
+      // 对 A/AAAA 记录进行地理增强（DoH 端点返回 JSON 时）
+      await enrichGeoOnServer(formatted);
       setJsonHeaders(res);
       return res.json(formatted);
     } else {
@@ -1045,7 +1063,6 @@ app.all(`/${DoH路径}`, async (req, res) => {
         code: 'QUERY_FAILED'
       });
     }
-
   } catch (error) {
     console.error(`[ERROR] ${new Date().toISOString()} DoH 请求处理错误:`, error);
     setJsonHeaders(res);
@@ -1059,6 +1076,10 @@ app.get('/', (req, res) => {
   const protocol = req.headers['x-forwarded-proto'] || 'https';
   const currentDohUrl = `${protocol}://${hostname}/${DoH路径}`;
   const adminUrl = `${protocol}://${hostname}/admin`;
+
+  function cmdBlock(commandText) {
+    return `<div class="cmd-block">${commandText}<button class="copy-btn" onclick="copyCommand(this)">📋 复制</button></div>`;
+  }
 
   const html = `<!DOCTYPE html>
 <html lang="zh-CN">
@@ -1235,20 +1256,53 @@ app.get('/', (req, res) => {
       border-radius: 8px;
       margin-top: 15px;
     }
-    .curl-example {
+    .cmd-block {
+      position: relative;
       background: #1e1e1e;
       color: #d4d4d4;
-      padding: 15px;
+      padding: 10px 15px;
+      padding-right: 80px;
       border-radius: 8px;
       font-family: monospace;
       font-size: 13px;
       overflow-x: auto;
       white-space: pre-wrap;
       word-break: break-all;
-      margin: 8px 0;
+      margin: 6px 0;
     }
-    .curl-example a {
+    .cmd-block a {
       color: #66d9ef;
+    }
+    .cmd-block.light {
+      background: #f0f0f0;
+      color: #333;
+    }
+    .cmd-block.light a {
+      color: #0055cc;
+    }
+    .copy-btn {
+      position: absolute;
+      top: 6px;
+      right: 6px;
+      background: rgba(255,255,255,0.15);
+      border: 1px solid rgba(255,255,255,0.2);
+      color: #ddd;
+      padding: 3px 10px;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 12px;
+      transition: all 0.3s;
+      backdrop-filter: blur(4px);
+      user-select: none;
+    }
+    .copy-btn:hover {
+      background: rgba(255,255,255,0.3);
+      color: #fff;
+    }
+    .copy-btn.copied {
+      background: rgba(76, 175, 80, 0.4);
+      border-color: #4caf50;
+      color: #4caf50;
     }
     .tag {
       display: inline-block;
@@ -1259,12 +1313,34 @@ app.get('/', (req, res) => {
       border-radius: 12px;
       margin-right: 6px;
     }
+    .example-section {
+      margin-bottom: 16px;
+      border-left: 3px solid #667eea;
+      padding-left: 12px;
+    }
+    .example-title {
+      font-weight: bold;
+      color: #667eea;
+      margin-bottom: 8px;
+    }
+    .example-desc {
+      font-size: 13px;
+      color: #666;
+      margin-top: 4px;
+    }
+    .geo-badge {
+      color: #888;
+      font-size: 12px;
+      margin-left: 8px;
+    }
     @media (max-width: 768px) {
       .upstream-table { font-size: 12px; }
       .upstream-table th, .upstream-table td { padding: 6px; }
       .header { flex-direction: column; text-align: center; }
       .header h1 { font-size: 1.8em; }
       .header-sub { text-align: center; }
+      .cmd-block { font-size: 11px; padding: 8px 10px; padding-right: 70px; }
+      .copy-btn { top: 4px; right: 4px; font-size: 10px; padding: 2px 8px; }
     }
   </style>
 </head>
@@ -1327,101 +1403,87 @@ app.get('/', (req, res) => {
         以下命令中的端点 <code>${escapeHtml(currentDohUrl)}</code> 已自动替换为您的实际地址，可直接复制运行。
       </div>
 
-      <!-- 1. GET JSON -->
-      <div style="margin-bottom:16px; border-left:3px solid #667eea; padding-left:12px;">
-        <div style="font-weight:bold; color:#667eea;">1️⃣ GET 请求 – JSON 格式（?name=）</div>
-        <div class="curl-example"># A 记录 (IPv4)
+      <div class="example-section">
+        <div class="example-title">1️⃣ GET 请求 – JSON 格式（?name=）</div>
+        ${cmdBlock(`# A 记录 (IPv4)
 curl -H "accept: application/dns-json" \\
-  "${escapeHtml(currentDohUrl)}?name=google.com&type=A"
-
-# AAAA 记录 (IPv6)
+  "${escapeHtml(currentDohUrl)}?name=google.com&type=A"`)}
+        ${cmdBlock(`# AAAA 记录 (IPv6)
 curl -H "accept: application/dns-json" \\
-  "${escapeHtml(currentDohUrl)}?name=google.com&type=AAAA"
-
-# HTTPS 记录 (ECH 配置)
+  "${escapeHtml(currentDohUrl)}?name=google.com&type=AAAA"`)}
+        ${cmdBlock(`# HTTPS 记录 (ECH 配置)
 curl -H "accept: application/dns-json" \\
-  "${escapeHtml(currentDohUrl)}?name=cloudflare-ech.com&type=HTTPS"</div>
-        <div style="font-size:13px; color:#666;">预期：返回 JSON，Answer 中包含对应记录。</div>
+  "${escapeHtml(currentDohUrl)}?name=cloudflare-ech.com&type=HTTPS"`)}
+        <div class="example-desc">预期：返回 JSON，Answer 中包含对应记录。</div>
       </div>
 
-      <!-- 2. GET Wire Format -->
-      <div style="margin-bottom:16px; border-left:3px solid #667eea; padding-left:12px;">
-        <div style="font-weight:bold; color:#667eea;">2️⃣ GET 请求 – Wire Format（?dns=）</div>
-        <div class="curl-example"># 查询 google.com A 记录（Base64URL 编码示例）
+      <div class="example-section">
+        <div class="example-title">2️⃣ GET 请求 – Wire Format（?dns=）</div>
+        ${cmdBlock(`# 查询 google.com A 记录（Base64URL 编码示例）
 curl -H "accept: application/dns-message" \\
-  "${escapeHtml(currentDohUrl)}?dns=AAABAAABAAAAAAAAB2V4YW1wbGUDY29tAAABAAE"</div>
-        <div style="font-size:13px; color:#666;">
+  "${escapeHtml(currentDohUrl)}?dns=AAABAAABAAAAAAAAB2V4YW1wbGUDY29tAAABAAE"`)}
+        <div class="example-desc">
           预期：返回二进制 DNS 数据（终端会显示乱码，这是正常的）。<br>
           验证响应头：<code>content-type: application/dns-message</code>
         </div>
       </div>
 
-      <!-- 3. POST JSON -->
-      <div style="margin-bottom:16px; border-left:3px solid #667eea; padding-left:12px;">
-        <div style="font-weight:bold; color:#667eea;">3️⃣ POST 请求 – JSON Body</div>
-        <div class="curl-example"># A 记录查询
+      <div class="example-section">
+        <div class="example-title">3️⃣ POST 请求 – JSON Body</div>
+        ${cmdBlock(`# A 记录查询
 curl -X POST -H "Content-Type: application/dns-json" \\
   -d '{"name":"google.com","type":"A"}' \\
-  "${escapeHtml(currentDohUrl)}"
-
-# HTTPS 记录查询
+  "${escapeHtml(currentDohUrl)}"`)}
+        ${cmdBlock(`# HTTPS 记录查询
 curl -X POST -H "Content-Type: application/dns-json" \\
   -d '{"name":"cloudflare-ech.com","type":"HTTPS"}' \\
-  "${escapeHtml(currentDohUrl)}"</div>
-        <div style="font-size:13px; color:#666;">预期：返回 JSON，Answer 中包含记录。</div>
+  "${escapeHtml(currentDohUrl)}"`)}
+        <div class="example-desc">预期：返回 JSON，Answer 中包含记录。</div>
       </div>
 
-      <!-- 4. POST 表单 -->
-      <div style="margin-bottom:16px; border-left:3px solid #667eea; padding-left:12px;">
-        <div style="font-weight:bold; color:#667eea;">4️⃣ POST 请求 – 表单格式</div>
-        <div class="curl-example">curl -X POST -H "Content-Type: application/x-www-form-urlencoded" \\
+      <div class="example-section">
+        <div class="example-title">4️⃣ POST 请求 – 表单格式</div>
+        ${cmdBlock(`curl -X POST -H "Content-Type: application/x-www-form-urlencoded" \\
   -d "name=google.com&type=A" \\
-  "${escapeHtml(currentDohUrl)}"</div>
-        <div style="font-size:13px; color:#666;">预期：返回 JSON，Answer 中包含 IPv4 地址。</div>
+  "${escapeHtml(currentDohUrl)}"`)}
+        <div class="example-desc">预期：返回 JSON，Answer 中包含 IPv4 地址。</div>
       </div>
 
-      <!-- 5. POST Wire Format（已修复样式包裹） -->
-      <div style="margin-bottom:16px; border-left:3px solid #667eea; padding-left:12px;">
-        <div style="font-weight:bold; color:#667eea;">5️⃣ POST 请求 – Wire Format（原始二进制）</div>
-        <div class="curl-example"># 发送二进制数据
+      <div class="example-section">
+        <div class="example-title">5️⃣ POST 请求 – Wire Format（原始二进制）</div>
+        ${cmdBlock(`# 发送二进制数据
 echo -n "AAABAAABAAAAAAAAB2V4YW1wbGUDY29tAAABAAE" | base64 -d > query.bin
 curl -X POST -H "Content-Type: application/dns-message" --data-binary @query.bin \\
-  "${escapeHtml(currentDohUrl)}"</div>
-        <div style="font-size:13px; color:#666;">
+  "${escapeHtml(currentDohUrl)}"`)}
+        <div class="example-desc">
           预期：返回二进制 DNS 响应（终端显示乱码）。<br>
           验证响应头：<code>content-type: application/dns-message</code>
         </div>
       </div>
 
-      <!-- 浏览器配置 -->
-      <div style="border-top:1px solid #e0e0e0; padding-top:12px; margin-top:8px;">
-        <div style="font-weight:bold; color:#667eea;">🌐 浏览器访问 & 配置 DoH</div>
-        <div class="curl-example" style="background:#f0f0f0; color:#333;">
-          # 浏览器直接访问（显示 JSON）
-          <a href="${escapeHtml(currentDohUrl)}?name=google.com&type=A" target="_blank">${escapeHtml(currentDohUrl)}?name=google.com&type=A</a>
+      <div class="example-section" style="border-top:1px solid #e0e0e0; padding-top:12px; margin-top:8px;">
+        <div class="example-title">🌐 浏览器访问 & 配置 DoH</div>
+        ${cmdBlock(`# 浏览器直接访问（显示 JSON）
+${escapeHtml(currentDohUrl)}?name=google.com&type=A
 
-          # Chrome/Edge 配置 DoH
-          设置 → 隐私和安全 → 安全 → 使用安全 DNS → 自定义
-          填入：<strong>${escapeHtml(currentDohUrl)}</strong>
-        </div>
+# Chrome/Edge 配置 DoH
+设置 → 隐私和安全 → 安全 → 使用安全 DNS → 自定义
+填入：${escapeHtml(currentDohUrl)}`)}
+        <div class="example-desc">点击复制按钮将复制完整内容。</div>
       </div>
 
-      <!-- 诊断命令 -->
-      <div style="margin-top:12px; border-top:1px solid #e0e0e0; padding-top:12px;">
-        <div style="font-weight:bold; color:#667eea;">🔍 诊断辅助命令</div>
-        <div class="curl-example" style="background:#f0f0f0; color:#333;">
-# 查看完整响应头（确认 Content-Type）
-curl -I "${escapeHtml(currentDohUrl)}?name=google.com&type=A"
-
-# 查看 wire format 响应头
+      <div class="example-section" style="margin-top:12px; border-top:1px solid #e0e0e0; padding-top:12px;">
+        <div class="example-title">🔍 诊断辅助命令</div>
+        ${cmdBlock(`# 查看完整响应头（确认 Content-Type）
+curl -I "${escapeHtml(currentDohUrl)}?name=google.com&type=A"`)}
+        ${cmdBlock(`# 查看 wire format 响应头
 curl -I -H "accept: application/dns-message" \\
-  "${escapeHtml(currentDohUrl)}?dns=AAABAAABAAAAAAAAB2V4YW1wbGUDY29tAAABAAE"
-
-# 保存 wire format 响应到文件（避免终端乱码）
+  "${escapeHtml(currentDohUrl)}?dns=AAABAAABAAAAAAAAB2V4YW1wbGUDY29tAAABAAE"`)}
+        ${cmdBlock(`# 保存 wire format 响应到文件（避免终端乱码）
 curl -H "accept: application/dns-message" \\
   "${escapeHtml(currentDohUrl)}?dns=AAABAAABAAAAAAAAB2V4YW1wbGUDY29tAAABAAE" \\
-  --output response.bin
-</div>
+  --output response.bin`)}
+        <div class="example-desc">每个命令独立复制，方便按需使用。</div>
       </div>
     </div>
 
@@ -1434,66 +1496,46 @@ curl -H "accept: application/dns-message" \\
     const endpoint = '${escapeHtml(currentDohUrl)}';
     document.getElementById('endpoint').innerHTML = endpoint;
 
-    async function loadUpstreams() {
-      try {
-        const response = await fetch('/api/upstreams');
-        const data = await response.json();
-        renderUpstreams(data.upstreams, data.mode, data.selectedId);
-        updateCurrentInfo(data.currentUpstream, data.mode);
-      } catch (err) {
-        console.error('加载失败:', err);
-        setTimeout(loadUpstreams, 3000);
-      }
-    }
-
-    function renderUpstreams(upstreams, mode, selectedId) {
-      const tbody = document.getElementById('upstreamList');
-      if (!tbody) return;
-      tbody.innerHTML = '';
-
-      const sorted = [...upstreams].sort((a, b) => {
-        if (a.status === 'online' && b.status !== 'online') return -1;
-        if (a.status !== 'online' && b.status === 'online') return 1;
-        if (a.status === 'online' && b.status === 'online') {
-          return (a.responseTime || 9999) - (b.responseTime || 9999);
-        }
-        return 0;
+    // ================== 复制命令（过滤注释） ==================
+    function copyCommand(btn) {
+      const block = btn.parentElement;
+      const clone = block.cloneNode(true);
+      const btnClone = clone.querySelector('.copy-btn');
+      if (btnClone) btnClone.remove();
+      const lines = clone.textContent.split('\\n');
+      const filtered = lines.filter(line => {
+        const trimmed = line.trim();
+        return trimmed.length > 0 && !trimmed.startsWith('#');
       });
-
-      sorted.forEach(u => {
-        const row = tbody.insertRow();
-
-        const statusCell = row.insertCell(0);
-        let statusText = '', statusClass = '';
-        switch(u.status) {
-          case 'online': statusText = '● 在线'; statusClass = 'status-online'; break;
-          case 'offline': statusText = '○ 离线'; statusClass = 'status-offline'; break;
-          default: statusText = '◐ 检测中'; statusClass = 'status-checking';
+      const text = filtered.join('\\n');
+      navigator.clipboard.writeText(text).then(() => {
+        btn.textContent = '✅ 已复制';
+        btn.classList.add('copied');
+        setTimeout(() => {
+          btn.textContent = '📋 复制';
+          btn.classList.remove('copied');
+        }, 2000);
+      }).catch(() => {
+        const textarea = document.createElement('textarea');
+        textarea.value = text;
+        document.body.appendChild(textarea);
+        textarea.select();
+        try {
+          document.execCommand('copy');
+          btn.textContent = '✅ 已复制';
+          btn.classList.add('copied');
+          setTimeout(() => {
+            btn.textContent = '📋 复制';
+            btn.classList.remove('copied');
+          }, 2000);
+        } catch {
+          alert('复制失败，请手动复制');
         }
-        statusCell.innerHTML = '<span class="' + statusClass + '">' + statusText + '</span>';
-
-        const nameCell = row.insertCell(1);
-        let nameHtml = u.displayName;
-        if (mode === 'manual' && selectedId !== null && u.id === selectedId) {
-          nameHtml += ' <span style="background:#ff9800; color:white; padding:2px 8px; border-radius:4px; font-size:10px;">当前</span>';
-        }
-        nameCell.innerHTML = nameHtml;
-
-        const regionCell = row.insertCell(2);
-        regionCell.innerHTML = u.region || '全球';
-
-        const timeCell = row.insertCell(3);
-        timeCell.innerHTML = u.responseTime ? u.responseTime + 'ms' : '-';
+        document.body.removeChild(textarea);
       });
     }
 
-    function updateCurrentInfo(upstream, mode) {
-      const infoDiv = document.getElementById('currentInfo');
-      if (!infoDiv) return;
-      const modeText = mode === 'auto' ? '自动切换模式' : '手动固定模式';
-      infoDiv.innerHTML = '📡 当前使用: <strong>' + upstream + '</strong> | ' + modeText;
-    }
-
+    // ================== 显示结果（服务端已包含地理信息） ==================
     function formatMXRecord(r) {
       if (r.priority !== undefined) {
         return '<span style="color:#666; font-size:11px;">[' + r.priority + ']</span> ' + r.exchange;
@@ -1502,24 +1544,29 @@ curl -H "accept: application/dns-message" \\
     }
 
     function displayResults(data, domain, type) {
-      let html = '<strong>✅ ' + domain + ' 查询结果</strong><br>';
+      var html = '<strong>✅ ' + domain + ' 查询结果</strong><br>';
       if (data.upstream) html += '<small>📡 上游: ' + data.upstream + '</small><br><br>';
 
       if (type === 'all') {
-        const types = ['A', 'AAAA', 'CNAME', 'MX', 'TXT', 'NS'];
-        for (let i = 0; i < types.length; i++) {
-          const t = types[i];
-          const records = data[t] || [];
+        var types = ['A', 'AAAA', 'CNAME', 'MX', 'TXT', 'NS'];
+        for (var i = 0; i < types.length; i++) {
+          var t = types[i];
+          var records = data[t] || [];
           html += '<div class="record-card">';
           html += '<div class="record-title">📋 ' + t + ' 记录</div>';
           if (records.length > 0) {
-            for (let j = 0; j < records.length; j++) {
-              const r = records[j];
+            for (var j = 0; j < records.length; j++) {
+              var r = records[j];
+              var displayText;
               if (t === 'MX') {
-                html += '<div class="record-item">' + formatMXRecord(r) + '</div>';
+                displayText = formatMXRecord(r);
               } else {
-                html += '<div class="record-item">' + (r.data || r.exchange || JSON.stringify(r)) + '</div>';
+                displayText = r.data || r.exchange || JSON.stringify(r);
+                if ((t === 'A' || t === 'AAAA') && r.geo) {
+                  displayText += ' <span class="geo-badge">' + r.geo + '</span>';
+                }
               }
+              html += '<div class="record-item">' + displayText + '</div>';
             }
           } else {
             html += '<div class="record-item" style="color:#999;">无记录</div>';
@@ -1527,44 +1574,48 @@ curl -H "accept: application/dns-message" \\
           html += '</div>';
         }
       } else {
-        const records = data.Answer || [];
+        var records = data.Answer || [];
         html += '<div class="record-card">';
         html += '<div class="record-title">📋 ' + type + ' 记录</div>';
         if (records.length > 0) {
-          for (let i = 0; i < records.length; i++) {
-            const r = records[i];
+          for (var k = 0; k < records.length; k++) {
+            var r2 = records[k];
+            var displayText2;
             if (type === 'MX') {
-              html += '<div class="record-item">' + formatMXRecord(r) + '</div>';
+              displayText2 = formatMXRecord(r2);
             } else {
-              html += '<div class="record-item">' + (r.data || JSON.stringify(r)) + '</div>';
+              displayText2 = r2.data || JSON.stringify(r2);
+              if ((type === 'A' || type === 'AAAA') && r2.geo) {
+                displayText2 += ' <span class="geo-badge">' + r2.geo + '</span>';
+              }
             }
+            html += '<div class="record-item">' + displayText2 + '</div>';
           }
         } else {
           html += '<div class="record-item" style="color:#999;">无记录</div>';
         }
         html += '</div>';
       }
-
       return html;
     }
 
     async function queryDNS() {
-      const domain = document.getElementById('domain').value.trim();
-      const recordType = document.getElementById('recordType').value;
+      var domain = document.getElementById('domain').value.trim();
+      var recordType = document.getElementById('recordType').value;
       if (!domain) { alert('请输入域名'); return; }
 
-      const resultDiv = document.getElementById('result');
-      const queryBtn = document.getElementById('queryBtn');
+      var resultDiv = document.getElementById('result');
+      var queryBtn = document.getElementById('queryBtn');
       resultDiv.innerHTML = '<span class="loading"></span> 正在查询...';
       resultDiv.classList.add('show');
       queryBtn.disabled = true;
 
       try {
-        const url = '/api/dns?domain=' + encodeURIComponent(domain) + '&type=' + recordType;
-        const response = await fetch(url);
+        var url = '/api/dns?domain=' + encodeURIComponent(domain) + '&type=' + recordType;
+        var response = await fetch(url);
         if (!response.ok) throw new Error('HTTP ' + response.status);
-        const data = await response.json();
-
+        var data = await response.json();
+        // 服务端已附加 geo，客户端直接显示
         resultDiv.innerHTML = displayResults(data, domain, recordType);
         resultDiv.classList.remove('error');
       } catch (err) {
@@ -1578,6 +1629,63 @@ curl -H "accept: application/dns-message" \\
     document.getElementById('domain').addEventListener('keypress', function(e) {
       if (e.key === 'Enter') queryDNS();
     });
+
+    async function loadUpstreams() {
+      try {
+        var response = await fetch('/api/upstreams');
+        var data = await response.json();
+        renderUpstreams(data.upstreams, data.mode, data.selectedId);
+        updateCurrentInfo(data.currentUpstream, data.mode);
+      } catch (err) {
+        console.error('加载失败:', err);
+        setTimeout(loadUpstreams, 3000);
+      }
+    }
+
+    function renderUpstreams(upstreams, mode, selectedId) {
+      var tbody = document.getElementById('upstreamList');
+      if (!tbody) return;
+      tbody.innerHTML = '';
+      var sorted = upstreams.slice().sort(function(a, b) {
+        if (a.status === 'online' && b.status !== 'online') return -1;
+        if (a.status !== 'online' && b.status === 'online') return 1;
+        if (a.status === 'online' && b.status === 'online') {
+          return (a.responseTime || 9999) - (b.responseTime || 9999);
+        }
+        return 0;
+      });
+      sorted.forEach(function(u) {
+        var row = tbody.insertRow();
+        var statusCell = row.insertCell(0);
+        var statusText = '', statusClass = '';
+        switch(u.status) {
+          case 'online': statusText = '● 在线'; statusClass = 'status-online'; break;
+          case 'offline': statusText = '○ 离线'; statusClass = 'status-offline'; break;
+          default: statusText = '◐ 检测中'; statusClass = 'status-checking';
+        }
+        statusCell.innerHTML = '<span class="' + statusClass + '">' + statusText + '</span>';
+
+        var nameCell = row.insertCell(1);
+        var nameHtml = u.displayName;
+        if (mode === 'manual' && selectedId !== null && u.id === selectedId) {
+          nameHtml += ' <span style="background:#ff9800; color:white; padding:2px 8px; border-radius:4px; font-size:10px;">当前</span>';
+        }
+        nameCell.innerHTML = nameHtml;
+
+        var regionCell = row.insertCell(2);
+        regionCell.innerHTML = u.region || '全球';
+
+        var timeCell = row.insertCell(3);
+        timeCell.innerHTML = u.responseTime ? u.responseTime + 'ms' : '-';
+      });
+    }
+
+    function updateCurrentInfo(upstream, mode) {
+      var infoDiv = document.getElementById('currentInfo');
+      if (!infoDiv) return;
+      var modeText = mode === 'auto' ? '自动切换模式' : '手动固定模式';
+      infoDiv.innerHTML = '📡 当前使用: <strong>' + upstream + '</strong> | ' + modeText;
+    }
 
     loadUpstreams();
     setInterval(loadUpstreams, 10000);
