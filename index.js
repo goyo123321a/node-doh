@@ -91,7 +91,7 @@ let healthCheckRunning = false;
 // ============ 服务端地理信息缓存 ============
 const geoCache = new Map();
 const GEO_CACHE_TTL = 7 * 24 * 60 * 60 * 1000;        // 7 天
-const GEO_FAIL_TTL = 60 * 60 * 1000;                  // 1 小时
+const GEO_FAIL_TTL = 60 * 1000;                       // 60 秒
 
 // ============ 辅助函数 ============
 function escapeHtml(str) {
@@ -364,7 +364,6 @@ function parseDnsRequest(req) {
 
 // ============ 服务端地理位置增强函数 ============
 async function enrichGeoOnServer(data) {
-  // 收集所有 A/AAAA 记录的 IP
   const toEnrich = [];
   const collect = (records) => {
     if (!records) return;
@@ -375,19 +374,16 @@ async function enrichGeoOnServer(data) {
     });
   };
   if (data.Answer) collect(data.Answer);
-  // 如果 data 中有 A/AAAA 单独字段（如 all 查询），也收集
   ['A', 'AAAA'].forEach(t => {
     if (data[t]) collect(data[t]);
   });
   if (toEnrich.length === 0) return;
 
-  // 去重
   const uniqueIps = [...new Set(toEnrich.map(item => item.ip))];
   const now = Date.now();
   const needQueryIps = uniqueIps.filter(ip => {
     const cached = geoCache.get(ip);
     if (cached && cached.expireAt > now) {
-      // 有缓存且未过期，直接应用
       const items = toEnrich.filter(item => item.ip === ip);
       items.forEach(item => {
         if (cached.data && cached.data.status === 'success') {
@@ -401,7 +397,6 @@ async function enrichGeoOnServer(data) {
 
   if (needQueryIps.length === 0) return;
 
-  // 分批批量查询（每批最多 100 个）
   const batchSize = 100;
   for (let i = 0; i < needQueryIps.length; i += batchSize) {
     const batchIps = needQueryIps.slice(i, i + batchSize);
@@ -429,7 +424,6 @@ async function enrichGeoOnServer(data) {
             item.ref.geo = geo.country + ' ' + geo.as;
           });
         } else {
-          // 失败缓存短时间，避免频繁重试
           geoCache.set(ip, {
             data: null,
             expireAt: now + GEO_FAIL_TTL
@@ -438,11 +432,10 @@ async function enrichGeoOnServer(data) {
       });
     } catch (error) {
       console.warn('批量查询 IP 地理信息失败:', error);
-      // 网络错误，将这批 IP 缓存失败结果
       batchIps.forEach(ip => {
         geoCache.set(ip, {
           data: null,
-          expireAt: now + 5 * 60 * 1000 // 5 分钟
+          expireAt: now + 5 * 60 * 1000
         });
       });
     }
@@ -979,7 +972,6 @@ app.get('/api/dns', async (req, res) => {
         ...results
       };
       upstreamName = results.upstream || 'auto';
-      // 对 A/AAAA 记录进行地理增强
       await enrichGeoOnServer(resultData);
     } else {
       const result = await queryWithFallback(domain, type);
@@ -999,7 +991,6 @@ app.get('/api/dns', async (req, res) => {
         ...formatted
       };
       upstreamName = result.upstream;
-      // 对 A/AAAA 记录进行地理增强
       await enrichGeoOnServer(resultData);
     }
     setJsonHeaders(res);
@@ -1050,7 +1041,6 @@ app.all(`/${DoH路径}`, async (req, res) => {
     const result = await queryWithFallback(domain, type);
     if (result.success && result.data) {
       const formatted = formatDNSResponse(result.data, domain, type);
-      // 对 A/AAAA 记录进行地理增强（DoH 端点返回 JSON 时）
       await enrichGeoOnServer(formatted);
       setJsonHeaders(res);
       return res.json(formatted);
@@ -1461,17 +1451,22 @@ curl -X POST -H "Content-Type: application/dns-message" --data-binary @query.bin
         </div>
       </div>
 
+      <!-- 浏览器访问 & 配置 DoH（独立复制端点） -->
       <div class="example-section" style="border-top:1px solid #e0e0e0; padding-top:12px; margin-top:8px;">
-        <div class="example-title">🌐 浏览器访问 & 配置 DoH</div>
-        ${cmdBlock(`# 浏览器直接访问（显示 JSON）
-${escapeHtml(currentDohUrl)}?name=google.com&type=A
+        <div class="example-title">🌐 浏览器访问 &amp; 配置 DoH</div>
+        <div class="cmd-block light" style="background:#f0f0f0; color:#333; padding-right:15px;">
+          # 浏览器直接访问（显示 JSON）
+          <a href="${escapeHtml(currentDohUrl)}?name=google.com&type=A" target="_blank" style="color:#0055cc; word-break:break-all;">${escapeHtml(currentDohUrl)}?name=google.com&type=A</a>
 
-# Chrome/Edge 配置 DoH
-设置 → 隐私和安全 → 安全 → 使用安全 DNS → 自定义
-填入：${escapeHtml(currentDohUrl)}`)}
-        <div class="example-desc">点击复制按钮将复制完整内容。</div>
+          # Chrome/Edge 配置 DoH
+          设置 → 隐私和安全 → 安全 → 使用安全 DNS → 自定义
+          填入：<strong id="dohEndpoint">${escapeHtml(currentDohUrl)}</strong>
+          <button class="copy-btn" onclick="copyEndpoint(this)" style="position:relative; display:inline-block; margin-left:8px; top:auto; right:auto; background:rgba(0,0,0,0.1); border:1px solid #ccc; color:#333;">📋 复制端点</button>
+        </div>
+        <div class="example-desc">点击链接直接查看查询结果，或复制 DoH 端点地址填入浏览器设置。</div>
       </div>
 
+      <!-- 诊断命令 -->
       <div class="example-section" style="margin-top:12px; border-top:1px solid #e0e0e0; padding-top:12px;">
         <div class="example-title">🔍 诊断辅助命令</div>
         ${cmdBlock(`# 查看完整响应头（确认 Content-Type）
@@ -1526,6 +1521,36 @@ curl -H "accept: application/dns-message" \\
           btn.classList.add('copied');
           setTimeout(() => {
             btn.textContent = '📋 复制';
+            btn.classList.remove('copied');
+          }, 2000);
+        } catch {
+          alert('复制失败，请手动复制');
+        }
+        document.body.removeChild(textarea);
+      });
+    }
+
+    // ================== 复制 DoH 端点（只复制纯 URL） ==================
+    function copyEndpoint(btn) {
+      const url = document.getElementById('dohEndpoint').textContent;
+      navigator.clipboard.writeText(url).then(() => {
+        btn.textContent = '✅ 已复制';
+        btn.classList.add('copied');
+        setTimeout(() => {
+          btn.textContent = '📋 复制端点';
+          btn.classList.remove('copied');
+        }, 2000);
+      }).catch(() => {
+        const textarea = document.createElement('textarea');
+        textarea.value = url;
+        document.body.appendChild(textarea);
+        textarea.select();
+        try {
+          document.execCommand('copy');
+          btn.textContent = '✅ 已复制';
+          btn.classList.add('copied');
+          setTimeout(() => {
+            btn.textContent = '📋 复制端点';
             btn.classList.remove('copied');
           }, 2000);
         } catch {
@@ -1615,7 +1640,6 @@ curl -H "accept: application/dns-message" \\
         var response = await fetch(url);
         if (!response.ok) throw new Error('HTTP ' + response.status);
         var data = await response.json();
-        // 服务端已附加 geo，客户端直接显示
         resultDiv.innerHTML = displayResults(data, domain, recordType);
         resultDiv.classList.remove('error');
       } catch (err) {
