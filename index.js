@@ -1,5 +1,6 @@
 const express = require('express');
 const session = require('express-session');
+const dnsPacket = require('dns-packet');
 
 const app = express();
 const PORT = process.env.PORT || 7860;
@@ -40,6 +41,7 @@ const recordTypeMap = {
   'A': 1, 'AAAA': 28, 'CNAME': 5, 'MX': 15, 'TXT': 16, 'NS': 2,
   'SOA': 6, 'PTR': 12, 'SRV': 33, 'CAA': 257, 'HTTPS': 65, 'ANY': 255
 };
+const typeToName = Object.fromEntries(Object.entries(recordTypeMap).map(([k, v]) => [v, k]));
 
 // ============ 上游配置 ============
 const upstreamsConfig = [
@@ -88,10 +90,56 @@ let sortedAvailable = [];
 let currentUpstreamIndex = 0;
 let healthCheckRunning = false;
 
+// ============ DNS 缓存 ============
+const dnsCache = new Map();
+const DEFAULT_TTL = 60;
+
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, entry] of dnsCache) {
+    if (entry.expireAt <= now) {
+      dnsCache.delete(key);
+    }
+  }
+}, 60000);
+
+function getCacheKey(domain, type, format) {
+  return `${domain}:${type}:${format}`;
+}
+
+function getCached(domain, type, format) {
+  const key = getCacheKey(domain, type, format);
+  const entry = dnsCache.get(key);
+  if (entry && entry.expireAt > Date.now()) {
+    return entry.data;
+  }
+  return null;
+}
+
+function setCache(domain, type, format, data, ttlSeconds) {
+  const key = getCacheKey(domain, type, format);
+  const expireAt = Date.now() + ttlSeconds * 1000;
+  dnsCache.set(key, { data, expireAt });
+}
+
+// 从 JSON 响应中提取最小 TTL
+function getMinTTL(jsonData) {
+  if (!jsonData.Answer || jsonData.Answer.length === 0) {
+    return DEFAULT_TTL;
+  }
+  let minTtl = Infinity;
+  for (const ans of jsonData.Answer) {
+    if (ans.TTL !== undefined && ans.TTL < minTtl) {
+      minTtl = ans.TTL;
+    }
+  }
+  return minTtl === Infinity ? DEFAULT_TTL : minTtl;
+}
+
 // ============ 服务端地理信息缓存 ============
 const geoCache = new Map();
-const GEO_CACHE_TTL = 7 * 24 * 60 * 60 * 1000;        // 7 天
-const GEO_FAIL_TTL = 60 * 1000;                       // 60 秒
+const GEO_CACHE_TTL = 7 * 24 * 60 * 60 * 1000;
+const GEO_FAIL_TTL = 60 * 1000;
 
 // ============ 辅助函数 ============
 function escapeHtml(str) {
@@ -153,7 +201,6 @@ async function healthCheck() {
   healthCheckRunning = false;
 }
 
-// ============ 获取当前上游（自动模式始终用最快的） ============
 function getCurrentUpstream() {
   if (selectedUpstreamId !== null) {
     const selected = upstreams.find(u => u.id === selectedUpstreamId);
@@ -187,10 +234,22 @@ async function fetchWithFallback(endpoints, options, timeout = 10000) {
   throw lastError || new Error('所有上游均失败');
 }
 
-async function queryDoH(server, domain, type, timeout = 10000) {
-  const url = new URL(server);
+// ============ 核心查询函数（带缓存，仅 JSON） ============
+async function queryDoHWithCache(domain, type, format, timeout = 10000) {
+  // 仅处理 JSON，binary 在 DoH 端点单独处理
+  if (format !== 'json') throw new Error('Unsupported format');
+
+  const cached = getCached(domain, type, 'json');
+  if (cached) {
+    console.log(`[INFO] ${new Date().toISOString()} JSON 缓存命中: ${domain} ${type}`);
+    return cached;
+  }
+
+  const upstream = getCurrentUpstream();
+  const url = new URL(upstream.server);
   url.searchParams.set("name", domain);
   url.searchParams.set("type", type);
+
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), timeout);
   try {
@@ -199,25 +258,21 @@ async function queryDoH(server, domain, type, timeout = 10000) {
       signal: controller.signal
     });
     clearTimeout(timeoutId);
-    if (response.ok) {
-      const data = await response.json();
-      return { success: true, data };
-    } else {
-      return { success: false, data: null };
-    }
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const data = await response.json();
+    const ttl = getMinTTL(data);
+    setCache(domain, type, 'json', data, ttl);
+    return data;
   } catch (err) {
     clearTimeout(timeoutId);
-    return { success: false, data: null, error: err.message };
+    throw err;
   }
 }
 
 async function queryDNS(upstream, domain, type) {
   try {
-    const result = await queryDoH(upstream.server, domain, type, upstream.timeout);
-    if (result.success && result.data) {
-      return { success: true, data: result.data };
-    }
-    return { success: false, data: null };
+    const data = await queryDoHWithCache(domain, type, 'json', upstream.timeout);
+    return { success: true, data };
   } catch (err) {
     console.error(`[ERROR] ${new Date().toISOString()} queryDNS 异常: ${err.message}`);
     return { success: false, data: null };
@@ -227,10 +282,12 @@ async function queryDNS(upstream, domain, type) {
 async function queryWithFallback(domain, type, retryCount = 0) {
   const maxRetries = upstreams.length;
   const upstream = getCurrentUpstream();
-  const result = await queryDNS(upstream, domain, type);
-  if (result.success && result.data && (result.data.Answer?.length > 0)) {
-    return { success: true, data: result.data, upstream: upstream.displayName };
-  }
+  try {
+    const data = await queryDoHWithCache(domain, type, 'json', upstream.timeout);
+    if (data && data.Answer && data.Answer.length > 0) {
+      return { success: true, data, upstream: upstream.displayName };
+    }
+  } catch (err) {}
   if (retryCount < maxRetries) {
     return queryWithFallback(domain, type, retryCount + 1);
   }
@@ -298,12 +355,14 @@ function setJsonHeaders(res) {
   res.set('Expires', '0');
 }
 
+// ============ 解析 DNS 请求 ============
 function parseDnsRequest(req) {
   const contentType = req.headers['content-type'] || '';
   const accept = req.headers['accept'] || '';
   let domain = null;
   let type = 'A';
   let wireBody = null;
+
   if (req.method === 'GET') {
     const url = new URL(req.url, `http://${req.headers.host}`);
     if (url.searchParams.has('name')) {
@@ -311,9 +370,19 @@ function parseDnsRequest(req) {
       type = url.searchParams.get('type') || 'A';
     } else if (url.searchParams.has('dns')) {
       wireBody = url.searchParams.get('dns');
+      try {
+        const buffer = Buffer.from(wireBody, 'base64url');
+        const packet = dnsPacket.decode(buffer);
+        if (packet.questions && packet.questions.length > 0) {
+          const q = packet.questions[0];
+          domain = q.name;
+          type = typeToName[q.type] || 'A';
+        }
+      } catch (e) {}
     }
     return { domain, type, wireBody, accept, contentType };
   }
+
   if (req.method === 'POST') {
     const body = req.body;
     if (contentType.includes('application/dns-json')) {
@@ -344,6 +413,14 @@ function parseDnsRequest(req) {
       type = params.type || 'A';
     } else if (contentType.includes('application/dns-message')) {
       wireBody = body;
+      try {
+        const packet = dnsPacket.decode(body);
+        if (packet.questions && packet.questions.length > 0) {
+          const q = packet.questions[0];
+          domain = q.name;
+          type = typeToName[q.type] || 'A';
+        }
+      } catch (e) {}
     } else if (typeof body === 'string' && body.trim().startsWith('{')) {
       try {
         const json = JSON.parse(body);
@@ -359,10 +436,11 @@ function parseDnsRequest(req) {
     }
     return { domain, type, wireBody, accept, contentType };
   }
+
   return { domain, type, wireBody, accept, contentType };
 }
 
-// ============ 服务端地理位置增强函数 ============
+// ============ 服务端地理位置增强 ============
 async function enrichGeoOnServer(data) {
   const toEnrich = [];
   const collect = (records) => {
@@ -957,13 +1035,12 @@ app.get('/api/upstreams', (req, res) => {
   res.json(getCurrentStatus());
 });
 
-// ============ /api/dns 增强（服务端地理缓存） ============
+// ============ /api/dns 接口 ============
 app.get('/api/dns', async (req, res) => {
   const domain = req.query.domain || 'www.google.com';
   const type = req.query.type || 'A';
   try {
     let resultData;
-    let upstreamName;
     if (type === 'all') {
       const results = await queryAllTypes(domain);
       resultData = {
@@ -971,8 +1048,6 @@ app.get('/api/dns', async (req, res) => {
         upstream: results.upstream || 'auto',
         ...results
       };
-      upstreamName = results.upstream || 'auto';
-      await enrichGeoOnServer(resultData);
     } else {
       const result = await queryWithFallback(domain, type);
       if (!result.success) {
@@ -984,15 +1059,13 @@ app.get('/api/dns', async (req, res) => {
           error: '查询失败'
         });
       }
-      const formatted = formatDNSResponse(result.data, domain, type);
       resultData = {
-        Status: formatted.Status,
+        Status: 0,
         upstream: result.upstream,
-        ...formatted
+        ...formatDNSResponse(result.data, domain, type)
       };
-      upstreamName = result.upstream;
-      await enrichGeoOnServer(resultData);
     }
+    await enrichGeoOnServer(resultData);
     setJsonHeaders(res);
     res.json(resultData);
   } catch (err) {
@@ -1001,13 +1074,42 @@ app.get('/api/dns', async (req, res) => {
   }
 });
 
-// ============ DoH 端点 ============
+// ============ DoH 端点（核心，支持缓存） ============
 app.all(`/${DoH路径}`, async (req, res) => {
   const { method, headers, body } = req;
   const UA = headers['user-agent'] || 'DoH Client';
+  const accept = headers['accept'] || '';
+
   try {
-    let { domain, type, wireBody, contentType } = parseDnsRequest(req);
+    const parsed = parseDnsRequest(req);
+    let { domain, type, wireBody, contentType } = parsed;
+
+    if (!domain && wireBody) {
+      try {
+        const buffer = Buffer.isBuffer(wireBody) ? wireBody : Buffer.from(wireBody, 'base64url');
+        const packet = dnsPacket.decode(buffer);
+        if (packet.questions && packet.questions.length > 0) {
+          const q = packet.questions[0];
+          domain = q.name;
+          type = typeToName[q.type] || 'A';
+        }
+      } catch (e) {}
+    }
+
+    // 处理 wire 格式（binary）
     if (wireBody !== null) {
+      if (domain && type) {
+        const cachedBinary = getCached(domain, type, 'binary');
+        if (cachedBinary) {
+          console.log(`[INFO] ${new Date().toISOString()} 二进制缓存命中: ${domain} ${type}`);
+          res.set('Content-Type', 'application/dns-message');
+          res.set('Content-Length', cachedBinary.length);
+          res.set('Access-Control-Allow-Origin', '*');
+          return res.send(cachedBinary);
+        }
+      }
+
+      // 向上游请求
       const endpoints = upstreams.filter(u => u.status === 'online').map(u => u.server);
       if (endpoints.length === 0) endpoints.push(upstreams[0].server);
       let options = { headers: { 'User-Agent': UA } };
@@ -1029,27 +1131,50 @@ app.all(`/${DoH路径}`, async (req, res) => {
       const response = await fetchWithFallback(targetUrls, options, 10000);
       const arrayBuffer = await response.arrayBuffer();
       const responseBody = Buffer.from(arrayBuffer);
+
+      // 缓存 binary（提取 TTL）
+      if (domain && type) {
+        let ttl = DEFAULT_TTL;
+        try {
+          const packet = dnsPacket.decode(responseBody);
+          if (packet.answers && packet.answers.length > 0) {
+            let minTtl = Infinity;
+            for (const ans of packet.answers) {
+              if (ans.ttl !== undefined && ans.ttl < minTtl) {
+                minTtl = ans.ttl;
+              }
+            }
+            if (minTtl !== Infinity) ttl = minTtl;
+          }
+        } catch (e) {}
+        setCache(domain, type, 'binary', responseBody, ttl);
+      }
+
       res.set('Content-Type', 'application/dns-message');
       res.set('Content-Length', responseBody.length);
       res.set('Access-Control-Allow-Origin', '*');
       return res.status(response.status).send(responseBody);
     }
+
+    // JSON 格式
     if (!domain) {
       setJsonHeaders(res);
       return res.status(400).json({ error: '缺少 name 或 domain 参数' });
     }
-    const result = await queryWithFallback(domain, type);
-    if (result.success && result.data) {
-      const formatted = formatDNSResponse(result.data, domain, type);
-      await enrichGeoOnServer(formatted);
+
+    const upstream = getCurrentUpstream();
+    try {
+      const data = await queryDoHWithCache(domain, type, 'json', upstream.timeout);
+      await enrichGeoOnServer(data);
       setJsonHeaders(res);
-      return res.json(formatted);
-    } else {
+      return res.json(data);
+    } catch (err) {
+      console.error(`[ERROR] ${new Date().toISOString()} JSON 查询失败:`, err);
       setJsonHeaders(res);
       return res.status(500).json({
         Status: 2,
         Answer: [],
-        error: 'DNS 查询失败（所有上游均不可用）',
+        error: 'DNS 查询失败',
         code: 'QUERY_FAILED'
       });
     }
@@ -1491,7 +1616,6 @@ curl -H "accept: application/dns-message" \\
     const endpoint = '${escapeHtml(currentDohUrl)}';
     document.getElementById('endpoint').innerHTML = endpoint;
 
-    // ================== 复制命令（过滤注释） ==================
     function copyCommand(btn) {
       const block = btn.parentElement;
       const clone = block.cloneNode(true);
@@ -1530,7 +1654,6 @@ curl -H "accept: application/dns-message" \\
       });
     }
 
-    // ================== 复制 DoH 端点（只复制纯 URL） ==================
     function copyEndpoint(btn) {
       const url = document.getElementById('dohEndpoint').textContent;
       navigator.clipboard.writeText(url).then(() => {
@@ -1560,7 +1683,6 @@ curl -H "accept: application/dns-message" \\
       });
     }
 
-    // ================== 显示结果（服务端已包含地理信息） ==================
     function formatMXRecord(r) {
       if (r.priority !== undefined) {
         return '<span style="color:#666; font-size:11px;">[' + r.priority + ']</span> ' + r.exchange;
